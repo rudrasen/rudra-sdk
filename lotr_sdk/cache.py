@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -38,9 +40,18 @@ class CacheProtocol(Protocol):
     def clear(self) -> None: ...
 
 
-@dataclass
+@dataclass(frozen=True)
 class CacheConfig:
-    """Configuration for the in-memory cache.
+    """Immutable configuration for the in-memory cache.
+
+    ``frozen=True`` prevents post-construction mutation. Both ``InMemoryCache``
+    and ``HTTPClient`` hold a reference to the same config object; a mutable
+    config would allow silent divergence if a caller changed ``ttl`` after the
+    client was built — new cache entries would use the updated value while
+    ``HTTPClient._effective_ttl()`` might see a different value depending on
+    read timing. Freezing makes any mutation attempt a ``FrozenInstanceError``
+    at the exact point of the offending assignment rather than a silent
+    inconsistency later.
 
     Args:
         ttl:          Base time-to-live in seconds. Default 600 matches the API's
@@ -51,14 +62,22 @@ class CacheConfig:
                       Prevents a burst of simultaneous expirations (thundering herd).
         maxsize:      Maximum number of entries before LRU eviction begins.
         resource_ttl: Per-resource TTL overrides keyed by API resource name
-                      (e.g. ``{"movie": 1200, "quote": 300}``). Reserved for v2 —
-                      populate to override the global ``ttl`` per endpoint prefix.
+                      (e.g. ``{"movie": 1200, "quote": 300}``). A plain ``dict``
+                      is accepted and automatically coerced to a read-only
+                      ``MappingProxyType`` so the field stays immutable even
+                      though the dataclass is frozen.
     """
 
     ttl: int = 600
     jitter: float = 0.1
     maxsize: int = 256
-    resource_ttl: dict[str, int] = field(default_factory=dict)
+    resource_ttl: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        # Coerce plain dict → MappingProxyType so resource_ttl is truly read-only.
+        # frozen=True requires object.__setattr__ to bypass the freeze guard here.
+        if isinstance(self.resource_ttl, dict):
+            object.__setattr__(self, "resource_ttl", MappingProxyType(self.resource_ttl))
 
 
 class _CacheEntry:

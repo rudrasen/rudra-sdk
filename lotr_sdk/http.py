@@ -17,6 +17,7 @@ Request flow (when cache and retry are configured):
 
 from __future__ import annotations
 
+import random
 import threading
 import time
 import weakref
@@ -55,25 +56,31 @@ class RetryConfig:
     Retry behaviour:
     - 429 (RateLimitError): waits for ``retry_after`` seconds from the
       ``Retry-After`` response header (falls back to backoff formula when
-      header is absent or zero). The server signals the exact window reset time.
-    - 5xx / 502 / 503 (APIError): exponential backoff —
-      ``sleep = backoff_factor * 2 ** (attempt - 1)`` seconds.
+      header is absent or zero), then caps the sleep at ``max_wait``.
+    - 5xx / 502 / 503 (APIError): exponential backoff with ±50% jitter —
+      ``sleep = min(backoff_factor * 2^(attempt-1) * uniform(0.5, 1.5), max_wait)``.
     - 401 / 404: never retried regardless of ``retry_on`` — retrying the same
       credential or ID produces the same error on every attempt.
 
     Args:
         max_attempts:   Total attempts including the first (not extra retries).
                         ``3`` means one initial call plus up to two retries.
-        backoff_factor: Multiplier for the exponential sleep on 5xx.
-                        Attempt 1 failure → sleep ``backoff_factor * 1`` s.
-                        Attempt 2 failure → sleep ``backoff_factor * 2`` s.
+        backoff_factor: Base multiplier for the exponential sleep on 5xx/fallback.
+                        Attempt 1 failure → base ``backoff_factor * 1`` s (before jitter).
+                        Attempt 2 failure → base ``backoff_factor * 2`` s (before jitter).
         retry_on:       HTTP status codes that trigger a retry. 401 and 404
                         are ignored even if listed here.
+        max_wait:       Hard ceiling on any single sleep in seconds. Prevents
+                        runaway blocking when a server returns a large
+                        ``Retry-After`` value or backoff grows beyond a useful
+                        threshold. Default 60 s. Set to ``float("inf")`` to
+                        honour ``Retry-After`` without a cap.
     """
 
     max_attempts: int = 3
     backoff_factor: float = 1.0
     retry_on: list[int] = field(default_factory=lambda: [429, 500, 502, 503])
+    max_wait: float = 60.0
 
 
 def _make_cache_key(endpoint: str, params: dict[str, Any] | None) -> str:
@@ -121,7 +128,7 @@ class HTTPClient:
         self,
         api_key: str,
         base_url: str,
-        timeout: int = 10,
+        timeout: int | float | tuple[float, float] = 10,
         cache: CacheProtocol | None = None,
         cache_config: CacheConfig | None = None,
         retry_config: RetryConfig | None = None,
@@ -227,19 +234,21 @@ class HTTPClient:
                     raise
                 if attempt == cfg.max_attempts:
                     raise
-                wait = (
-                    float(exc.retry_after)
-                    if exc.retry_after > 0
-                    else self._backoff(attempt, cfg.backoff_factor)
-                )
-                time.sleep(wait)
+                # Respect Retry-After when present; fall back to jittered backoff.
+                # Cap both paths at max_wait so a large server header cannot block
+                # the calling thread indefinitely.
+                if exc.retry_after > 0:
+                    raw_wait = float(exc.retry_after)
+                else:
+                    raw_wait = self._jittered_backoff(attempt, cfg.backoff_factor)
+                time.sleep(min(raw_wait, cfg.max_wait))
                 last_exc = exc
             except APIError as exc:
                 if exc.status_code not in cfg.retry_on:
                     raise
                 if attempt == cfg.max_attempts:
                     raise
-                time.sleep(self._backoff(attempt, cfg.backoff_factor))
+                time.sleep(min(self._jittered_backoff(attempt, cfg.backoff_factor), cfg.max_wait))
                 last_exc = exc
 
         # Unreachable: the last iteration always raises.  Satisfies type checker.
@@ -376,8 +385,19 @@ class HTTPClient:
 
     @staticmethod
     def _backoff(attempt: int, factor: float) -> float:
-        """Exponential backoff: ``factor * 2^(attempt-1)`` seconds."""
+        """Pure exponential: ``factor * 2^(attempt-1)`` seconds (no jitter)."""
         return factor * (2 ** (attempt - 1))
+
+    @staticmethod
+    def _jittered_backoff(attempt: int, factor: float) -> float:
+        """Exponential backoff with ±50% jitter.
+
+        Multiplies the base sleep by ``uniform(0.5, 1.5)`` so concurrent
+        callers that failed at the same time do not retry in lock-step.
+        The minimum sleep is always 50% of the base value.
+        """
+        base = factor * (2 ** (attempt - 1))
+        return base * random.uniform(0.5, 1.5)
 
     def close(self) -> None:
         """Release the underlying connection pool."""

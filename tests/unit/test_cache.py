@@ -425,13 +425,14 @@ class TestHTTPClientRetry:
     ) -> None:
         sleep_calls: list[float] = []
         monkeypatch.setattr(http_module.time, "sleep", lambda s: sleep_calls.append(s))
+        monkeypatch.setattr(http_module.random, "uniform", lambda lo, hi: 1.0)
         data = _load_fixture("movies_list.json")
         resp.add(resp.GET, MOVIES_URL, status=429)  # no Retry-After header
         resp.add(resp.GET, MOVIES_URL, json=data)
 
         http = self._http_with_retry(max_attempts=2, backoff_factor=2.0)
         http._request("GET", "/movie")
-        # attempt 1 failure → sleep = backoff_factor * 2^(1-1) = 2.0 * 1 = 2.0
+        # base = 2.0 * 2^0 = 2.0; uniform returns 1.0 → jittered = 2.0; min(2.0, 60.0) = 2.0
         assert sleep_calls == [2.0]
 
     @resp.activate
@@ -440,16 +441,47 @@ class TestHTTPClientRetry:
     ) -> None:
         sleep_calls: list[float] = []
         monkeypatch.setattr(http_module.time, "sleep", lambda s: sleep_calls.append(s))
+        monkeypatch.setattr(http_module.random, "uniform", lambda lo, hi: 1.0)
         for _ in range(3):
             resp.add(resp.GET, MOVIES_URL, status=500)
 
         http = self._http_with_retry(max_attempts=3, backoff_factor=1.0)
         with pytest.raises(APIError):
             http._request("GET", "/movie")
-        # attempt 1 failure → sleep 1.0 (1.0 * 2^0)
-        # attempt 2 failure → sleep 2.0 (1.0 * 2^1)
+        # uniform returns 1.0 → jitter is neutral; base values: 1.0 * 2^0=1.0, 1.0 * 2^1=2.0
         # attempt 3 failure → raise (no sleep)
         assert sleep_calls == [1.0, 2.0]
+
+    @resp.activate
+    def test_max_wait_caps_retry_after_sleep(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(http_module.time, "sleep", lambda s: sleep_calls.append(s))
+        data = _load_fixture("movies_list.json")
+        # Server sends Retry-After: 300 — exceeds max_wait=60 → must be capped.
+        resp.add(resp.GET, MOVIES_URL, status=429, headers={"Retry-After": "300"})
+        resp.add(resp.GET, MOVIES_URL, json=data)
+
+        http = self._http_with_retry(max_attempts=2, max_wait=60.0)
+        http._request("GET", "/movie")
+        assert sleep_calls == [60.0]
+
+    @resp.activate
+    def test_max_wait_caps_backoff_sleep(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(http_module.time, "sleep", lambda s: sleep_calls.append(s))
+        monkeypatch.setattr(http_module.random, "uniform", lambda lo, hi: 1.0)
+        data = _load_fixture("movies_list.json")
+        # backoff_factor=100 → base=100s, far above max_wait=5 → must be capped.
+        resp.add(resp.GET, MOVIES_URL, status=500)
+        resp.add(resp.GET, MOVIES_URL, json=data)
+
+        http = self._http_with_retry(max_attempts=2, backoff_factor=100.0, max_wait=5.0)
+        http._request("GET", "/movie")
+        assert sleep_calls == [5.0]
 
     @resp.activate
     def test_401_is_never_retried(

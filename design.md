@@ -11,10 +11,8 @@ A Python SDK for The One API (Lord of the Rings data). Architecture decisions, r
 - Synchronous HTTP via `requests.Session`
 - Pagination, sorting, and field filtering via `FilterOptions`
 - SDK-specific exception hierarchy with centralised status-code mapping
-
-**Designed for v2 — not yet implemented:**
-- In-memory TTL cache with LRU eviction, jitter, and dog-pile prevention (`CacheProtocol` interface ships in v1)
-- Retry with exponential backoff (`RetryConfig` API documented in section 8.1)
+- In-memory TTL cache with LRU eviction, jitter, and dog-pile prevention (`CacheProtocol`, `CacheConfig`, `InMemoryCache`)
+- Retry with exponential backoff, ±50% jitter, and `max_wait` ceiling (`RetryConfig`)
 
 **Explicitly out of scope:**
 - Async client (httpx/aiohttp)
@@ -53,8 +51,8 @@ A Python SDK for The One API (Lord of the Rings data). Architecture decisions, r
           │  • requests.Session                   │
           │  • Bearer token injection             │
           │  • status → exception mapping         │
-          │  • RetryConfig [v2]                   │
-          │  • CacheProtocol [v2]                 │
+          │  • RetryConfig                        │
+          │  • CacheProtocol                      │
           └────────┬─────────────────┬────────────┘
                    │                 │
      ┌─────────────▼──┐   ┌──────────▼──────────────────┐
@@ -65,14 +63,14 @@ A Python SDK for The One API (Lord of the Rings data). Architecture decisions, r
      │  RateLimitError│   └──────────────────────────────┘
      │  APIError      │
      │  ValidationError   ┌──────────────────────────────┐
-     └────────────────┘   │        cache.py [v2]         │
+     └────────────────┘   │        cache.py              │
                           │  CacheProtocol (interface)   │
                           │  InMemoryCache               │
                           │  CacheConfig                 │
                           └──────────────────────────────┘
 ```
 
-### Request Flow (v2 cache design)
+### Request Flow
 
 ```
 resource.list(filters)
@@ -114,6 +112,39 @@ client.quotes.get(quote_id: str) -> Quote
 ```
 
 All list methods accept an optional `FilterOptions` for pagination, sorting, and field filtering. All methods raise from the `LotRError` hierarchy on failure.
+
+---
+
+### Production Defaults Factory
+
+**Decision:** `LotRClient.with_defaults()` classmethod pre-configures `CacheConfig(ttl=600, jitter=0.1)` and `RetryConfig(max_attempts=3, backoff_factor=1.0)`.
+
+**Reasoning:** The primary constructor is intentionally minimal — no cache, no retry — so short-lived scripts and notebooks don't pay for what they don't need. However, a first-time user building a production integration must know to import two separate configuration classes, understand what values to set, and understand why. A named factory removes that cognitive load without changing the default constructor behaviour. Explicitly provided `cache_config` or `retry_config` arguments override the defaults, so the factory isn't a straitjacket.
+
+The classmethod pattern follows Python stdlib convention (`dict.fromkeys`, `datetime.fromtimestamp`, `Path.cwd`) and is idiomatic for "alternative constructor with opinionated defaults."
+
+**Tradeoff:** Two ways to construct the client. New contributors may ask which to use. The answer is: `with_defaults()` for production services; `LotRClient()` when you need explicit control or are writing scripts/tests.
+
+**Alternatives considered:**
+
+| Alternative | Why rejected |
+|---|---|
+| Change primary constructor defaults to enable cache + retry | Breaking change for callers relying on current behaviour; surprising to allocate memory on a bare `LotRClient()` |
+| `preset: Literal["minimal", "production"]` parameter | Mixes factory concern into the constructor; "minimal" and "production" are vague labels that resist precise documentation |
+
+---
+
+### `__repr__`
+
+**Decision:** `LotRClient.__repr__` returns a log-safe string showing `base_url`, `timeout`, and cache/retry status (`"enabled"` or `"disabled"`). The API key is never included.
+
+**Reasoning:** Without `__repr__`, every REPL session and debugger inspection of a client returns `<lotr_sdk.client.LotRClient object at 0x...>`, which gives no signal about whether caching or retry is active. This matters when debugging "why isn't this instance caching?" in production.
+
+The config state is stored directly on `LotRClient` at construction time (four scalar attributes) rather than being read back through `self._http._cache_config`. Piercing through `HTTPClient`'s private attributes would create tight coupling between `__repr__` and `HTTPClient`'s internal structure — any refactor of `HTTPClient` internals would silently break the repr. Storing on `self` keeps the repr contract independent.
+
+**Security invariant:** `__repr__` must be safe to emit in logs. The Bearer token is therefore explicitly excluded and the implementation accesses no path that could reach `_session.headers`. This is a structural guarantee, not a documentation note — the repr attributes are populated before the `HTTPClient` is constructed, so there is no reference path from them to the credential.
+
+**Tradeoff:** Four extra scalar attributes per client instance (`_repr_base_url`, `_repr_timeout`, `_repr_cache`, `_repr_retry`). Memory cost is negligible; clarity of the repr/security boundary is the gain.
 
 ---
 
@@ -183,8 +214,8 @@ All list methods accept an optional `FilterOptions` for pagination, sorting, and
 |--------|-----------|----------|
 | 401 | `AuthError` | Never — hardcoded |
 | 404 | `NotFoundError` | Never — hardcoded |
-| 429 | `RateLimitError` | Yes, via `RetryConfig` [v2] |
-| 5xx | `APIError` | Yes, via `RetryConfig` [v2] |
+| 429 | `RateLimitError` | Yes, via `RetryConfig` |
+| 5xx | `APIError` | Yes, via `RetryConfig` |
 | other 4xx | `APIError` | No |
 | network failure | `APIError(status_code=0)` | No |
 | parse failure | `ValidationError` | No |
@@ -288,14 +319,15 @@ LotRError (base — catch all SDK errors in one block)
 
 ### 8.1 Retry, Timeout, and Rate Limit Strategy
 
-**RetryConfig (v2 — not yet implemented):**
+**RetryConfig:**
 
 ```python
 @dataclass
 class RetryConfig:
     max_attempts: int = 3
-    backoff_factor: float = 0.5   # sleep = backoff_factor * 2^(attempt - 1)
+    backoff_factor: float = 1.0
     retry_on: list[int] = field(default_factory=lambda: [429, 500, 502, 503])
+    max_wait: float = 60.0          # hard ceiling on any single sleep (seconds)
 ```
 
 **Decision:** Optional `RetryConfig` at client init; if absent, the client makes exactly one attempt.
@@ -303,6 +335,35 @@ class RetryConfig:
 **Reasoning:** Not all callers need retry logic (scripts, notebooks, one-shot tools). Imposing automatic retries on every caller masks transient errors that the caller's own orchestration handles. Opt-in keeps the simple path simple.
 
 **Tradeoff:** Without `RetryConfig`, a transient 429 or 503 is surfaced immediately as an exception the caller must handle.
+
+---
+
+**Backoff formula (5xx and 429 without `Retry-After`):**
+
+```
+sleep = min(backoff_factor * 2^(attempt-1) * uniform(0.5, 1.5), max_wait)
+```
+
+- **Exponential base** — doubles the wait on each consecutive failure, giving the server progressively more recovery time.
+- **±50% jitter** — multiplies the base by `uniform(0.5, 1.5)` so concurrent callers that fail at the same moment do not retry in lock-step. Without jitter, all threads wake simultaneously and reproduce the thundering herd that triggered the error.
+- **`max_wait` ceiling (default 60 s)** — hard cap on any single sleep. Without it, a server returning `Retry-After: 86400` would block the calling thread for 24 hours with no escape. 60 s is chosen as a value that prevents runaway blocking while still giving the server time to recover from typical transient failures. Callers who need to honour large `Retry-After` windows (e.g. the API's 10-minute quota reset) should set `max_wait=600` or `max_wait=float("inf")`.
+
+**429 with `Retry-After` present:**
+
+```
+sleep = min(retry_after, max_wait)
+```
+
+Jitter is not applied to server-supplied waits — the `Retry-After` value already reflects the server's actual quota reset time, so adding noise would only cause premature retries. The `max_wait` cap still applies so the caller is not blocked longer than configured.
+
+**Default values and their rationale:**
+
+| Field | Default | Rationale |
+|---|---|---|
+| `max_attempts` | `3` | One real call plus two retries; covers most transient failures without excessive latency |
+| `backoff_factor` | `1.0` | Base sleeps of 1 s, 2 s (before jitter); low enough for interactive use, high enough for transient recovery |
+| `max_wait` | `60.0 s` | Prevents thread blocking beyond one minute; callers targeting the API's 10-min quota window should raise this |
+| `retry_on` | `[429, 500, 502, 503]` | Covers rate limiting and the most common server-side transient errors; excludes 401/404 (semantic errors, never transient) |
 
 ---
 
@@ -330,8 +391,6 @@ class RetryConfig:
 
 ## 9. Caching Strategy
 
-*(v2 — designed, not yet implemented. `CacheProtocol` interface will ship in v1.)*
-
 ### Design
 
 **Decision:** Optional in-memory TTL cache with LRU eviction, disabled by default. Callers opt in via `CacheConfig`.
@@ -339,15 +398,27 @@ class RetryConfig:
 ```python
 @dataclass
 class CacheConfig:
-    ttl: int = 300             # seconds before entry expires
+    ttl: int = 600             # seconds before entry expires; matches the API's 10-min rate-limit window
     jitter: float = 0.1        # max fraction of TTL added as positive noise (0–10%)
     maxsize: int = 256          # LRU eviction when exceeded
-    resource_ttl: dict[str, int] = field(default_factory=dict)  # reserved for v2
+    resource_ttl: dict[str, int] = field(default_factory=dict)  # per-resource TTL override
 ```
 
 **Reasoning:** The LoTR dataset is static; caching trades memory for reduced API calls and rate-limit exposure. In-memory requires no external infrastructure and covers the majority of use cases (scripts, single-process web apps, notebooks).
 
 **Tradeoff:** Not shared across processes. A multi-worker deployment has independent caches per worker. `CacheProtocol` is the escape hatch.
+
+---
+
+### CacheConfig Immutability
+
+**Decision:** `CacheConfig` is a `frozen=True` dataclass. `resource_ttl` is stored as `MappingProxyType` rather than `dict`.
+
+**Reasoning:** Both `InMemoryCache` and `HTTPClient` hold a reference to the same `CacheConfig` instance. `InMemoryCache` uses `config.ttl`, `config.jitter`, and `config.maxsize` when writing entries; `HTTPClient._effective_ttl()` uses `config.resource_ttl` and `config.ttl` when choosing the TTL to pass to `cache.set()`. If the config were mutable, a caller who changes `config.ttl = 30` after client construction would cause the two owners to read different effective values at different times depending on race conditions — the window between an `InMemoryCache.set()` and an `HTTPClient._effective_ttl()` call is small but non-zero. `frozen=True` turns any mutation attempt into an immediate `FrozenInstanceError` at the offending line rather than a silent divergence that would manifest as intermittent TTL mismatches.
+
+`resource_ttl` requires special handling because Python's `frozen=True` prevents attribute reassignment but does not prevent mutation of a mutable object (e.g. `config.resource_ttl["movie"] = 999` would still succeed on a plain `dict`). `MappingProxyType` closes this gap: it is a read-only view over the underlying dict. A `__post_init__` method coerces any plain `dict` passed by callers to `MappingProxyType` via `object.__setattr__` (the only way to set attributes inside a frozen dataclass's initialisation path).
+
+**Tradeoff:** Callers who expected to build a `CacheConfig` and modify it incrementally before passing it to the client must construct it in one step. In practice, config objects are always constructed in a single expression; no known caller pattern requires incremental mutation.
 
 ---
 
@@ -393,11 +464,10 @@ class CacheProtocol(Protocol):
 3. Thread A fetches → writes cache → releases per-key lock
 4. Thread B acquires → re-checks cache → hits → returns without an API call
 
-**Known v2 gaps:**
+**Known gap:**
 
-| Gap | v2 fix |
-|-----|--------|
-| Per-key locks accumulate (never freed after eviction) | `weakref.WeakValueDictionary` — GC'd when no thread holds a live reference |
+| Gap | Future fix |
+|-----|-----------|
 | Global `RLock` serialises concurrent reads | Reader-writer lock — concurrent reads in parallel, exclusive writes |
 
 ---
@@ -451,15 +521,23 @@ Adding `httpx` for async doubles the client interface with no v1 benefit; deferr
 
 ---
 
-## 12. v2 Roadmap and Extensibility
+## 12. Roadmap and Extensibility
 
-| Feature | Extension point already in v1 | Implementation notes |
-|---------|-------------------------------|----------------------|
-| In-memory TTL cache | `CacheProtocol` interface | `InMemoryCache` wrapping `_TTLLRUCache` (OrderedDict-backed, no new runtime deps) |
-| Per-resource TTL | `CacheConfig.resource_ttl` field | `HTTPClient.get()` needs `resource: str` param; fallback to `CacheConfig.ttl` if key absent |
-| External cache backends | `CacheProtocol` | Redis: `SET NX EX` for atomic distributed lock; Memcached: CAS operations |
-| Retry with backoff | `RetryConfig` dataclass API documented above | Wraps `HTTPClient._request()` in a retry loop; 401/404 remain non-retryable |
+### Shipped
+
+| Feature | Where |
+|---------|-------|
+| In-memory TTL + LRU cache with jitter and dog-pile prevention | `lotr_sdk/cache.py` — `InMemoryCache`, `CacheConfig`, `CacheProtocol` |
+| Per-resource TTL override | `CacheConfig.resource_ttl` — looked up in `HTTPClient._effective_ttl()` |
+| Per-key lock GC via `WeakValueDictionary` | `HTTPClient._key_locks` — locks freed when no thread holds a reference |
+| Retry with exponential backoff, ±50% jitter, `max_wait` ceiling | `lotr_sdk/http.py` — `RetryConfig`, `HTTPClient._execute_with_retry()` |
+| 429 `extend_all_ttl` on rate-limit hit | `InMemoryCache.extend_all_ttl()`, called duck-typed from `HTTPClient._request()` |
+
+### Still ahead
+
+| Feature | Extension point | Notes |
+|---------|-----------------|-------|
+| External cache backends (Redis, Memcached) | `CacheProtocol` | Redis: `SET NX EX` for atomic distributed lock; Memcached: CAS operations |
 | Async client | Separate `AsyncLotRClient` class | `httpx.AsyncClient`; sync `LotRClient` remains the default |
 | Additional endpoints | Additive resource classes | `/book`, `/chapter`, `/character` follow the same namespaced resource pattern |
-| Per-key lock GC | `InMemoryCache` internals | Replace per-key lock `dict` with `weakref.WeakValueDictionary` |
-| Read concurrency | `InMemoryCache` internals | Upgrade global `RLock` to reader-writer lock; concurrent reads proceed in parallel |
+| Concurrent read performance | `InMemoryCache` internals | Upgrade global `RLock` to reader-writer lock — concurrent reads proceed in parallel; currently serialised |
