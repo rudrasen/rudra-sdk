@@ -1,18 +1,15 @@
 """
 Movie model — maps the /movie and /movie/{id} response shape.
 
-Assumption: all numeric fields from the API are always present (no Optional).
-  Evidence: all 8 movies in the fixtures carry every field.
-  If a future API change omits a field, Pydantic will raise ValidationError
-  and the SDK will surface it as lotr_sdk.ValidationError (mapped in http.py).
+frozen=True: API responses are immutable facts. Frozen models are also
+hashable, which is required for cache key construction in v2.
 
-Assumption: runtimeInMinutes / academyAward* are always integers in the API.
-  budgetInMillions and boxOfficeRevenueInMillions can be float (e.g. 958.4),
-  so all numeric fields are typed float to allow Pydantic's int→float coercion.
+All numeric fields are typed float to allow Pydantic's int→float coercion
+(e.g. budgetInMillions can be 958.4). If the API omits a field in a future
+response, Pydantic raises ValidationError → lotr_sdk.ValidationError.
 
-Field aliasing: API uses camelCase (_id, runtimeInMinutes …).
-  Python attributes use snake_case. populate_by_name=True allows callers to
-  construct Movie(id=...) in tests without needing the underscore alias.
+populate_by_name=True allows tests to construct Movie(id=...) without
+the underscore alias.
 """
 
 from __future__ import annotations

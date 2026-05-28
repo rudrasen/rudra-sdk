@@ -1,31 +1,63 @@
 """
 FilterOptions — caller-facing model for pagination, sorting, and field filtering.
 
-NOT frozen: users construct this incrementally, e.g.:
-    opts = FilterOptions(limit=10)
-    opts.sort_by = "budgetInMillions"   # mutating before passing to a resource
+Not frozen: callers may build incrementally (e.g. set sort_by after construction).
 
-The One API query-param conventions (assumption — derived from API docs + fixtures):
+The One API query-param conventions:
     Pagination : ?limit=N&page=N&offset=N
-    Sorting    : ?sort=<field>:<asc|desc>   e.g. ?sort=budgetInMillions:desc
-    Filtering  : ?<field>=<value>           e.g. ?name=The Two Towers
-                 (simple equality only; regex / operator variants are out of v1 scope)
+    Sorting    : ?sort=<field>:<asc|desc>      e.g. ?sort=budgetInMillions:desc
+    Filtering  : key format varies by operator (see table below)
 
-Assumption: if sort_by is given without sort_order, "asc" is used as the default.
-Assumption: if filter_value is given without filter_field, the filter is silently
-  dropped — there is no safe default field to filter on. Callers should always
-  supply both together.
-Assumption: all values are serialised to str in the returned dict so they can be
-  passed directly as requests params= without further coercion.
+FilterOperator → to_query_params() key format:
+    EQ         : {field: value}           → ?field=value
+    NEQ        : {f"{field}!": value}     → ?field!=value
+    LT         : {f"{field}<": value}     → ?field<value
+    GT         : {f"{field}>": value}     → ?field>value
+    GTE        : {f"{field}>=": value}    → ?field>=value
+    LTE        : {f"{field}<=": value}    → ?field<=value
+    EXISTS     : {field: ""}              → ?field=
+    NOT_EXISTS : {f"!{field}": ""}        → ?!field=
+    REGEX      : {field: value}           → ?field=/pattern/flags
+    NOT_REGEX  : {f"{field}!": value}     → ?field!=/pattern/flags
+
+sort_by without sort_order defaults to "asc".
+LT/GT/GTE/LTE require a numeric filter_value; validated at construction time.
 """
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
-__all__ = ["FilterOptions"]
+__all__ = ["FilterOperator", "FilterOptions"]
+
+_NUMERIC_OPS_REQUIRING_NUMERIC_VALUE = frozenset(["lt", "gt", "gte", "lte"])
+
+
+class FilterOperator(str, Enum):
+    """Comparison operator applied to filter_field when building query params.
+
+    Maps to The One API's URL query filter syntax. See module docstring for the
+    exact key format each operator produces in to_query_params().
+
+    Comma-separated filter_value with EQ produces inclusion matching
+    (e.g. ``name=The Hobbit,The Two Towers``). The same with NEQ produces
+    exclusion matching. No separate IN/NIN operators are needed — the value
+    format drives that server-side behaviour.
+    """
+
+    EQ = "eq"
+    NEQ = "neq"
+    LT = "lt"
+    GT = "gt"
+    GTE = "gte"
+    LTE = "lte"
+    EXISTS = "exists"
+    NOT_EXISTS = "not_exists"
+    REGEX = "regex"
+    NOT_REGEX = "not_regex"
 
 
 class FilterOptions(BaseModel):
@@ -39,12 +71,45 @@ class FilterOptions(BaseModel):
     sort_order: Optional[Literal["asc", "desc"]] = None
     filter_field: Optional[str] = None
     filter_value: Optional[str] = None
+    filter_operator: FilterOperator = FilterOperator.EQ
+
+    @model_validator(mode="after")
+    def _validate_numeric_operator_value(self) -> "FilterOptions":
+        """Raise if a numeric operator is paired with a non-numeric filter_value.
+
+        LT, GT, GTE, LTE have no meaning on string fields; catching this at
+        construction time surfaces misuse before the invalid query reaches the API.
+        Each comma-separated part of filter_value is validated independently so
+        that multi-value numeric fields (e.g. ``runtimeInMinutes=178,201``) are
+        handled correctly for EQ — but those operators do not reach this branch.
+        """
+        if self.filter_operator.value not in _NUMERIC_OPS_REQUIRING_NUMERIC_VALUE:
+            return self
+        if self.filter_value is None:
+            raise ValueError(
+                f"filter_value is required when filter_operator is "
+                f"'{self.filter_operator.value}'"
+            )
+        if "," in self.filter_value:
+            raise ValueError(
+                f"Operator '{self.filter_operator.value}' does not support "
+                "comma-separated values; use EQ or NEQ for multi-value matching"
+            )
+        try:
+            float(self.filter_value.strip())
+        except ValueError:
+            raise ValueError(
+                f"Operator '{self.filter_operator.value}' requires a numeric "
+                f"filter_value; got {self.filter_value!r}"
+            )
+        return self
 
     def to_query_params(self) -> dict[str, str | int]:
         """Return a dict ready to pass as ``params=`` to requests.
 
-        Only non-None values are included.  Sorting is collapsed into the
-        single ``sort=field:order`` form the API expects.
+        Only non-None values are included. Sorting is collapsed into the
+        single ``sort=field:order`` form the API expects. Filtering key format
+        varies by operator — see module docstring for the mapping.
         """
         params: dict[str, str | int] = {}
 
@@ -59,7 +124,37 @@ class FilterOptions(BaseModel):
             order = self.sort_order or "asc"
             params["sort"] = f"{self.sort_by}:{order}"
 
-        if self.filter_field is not None and self.filter_value is not None:
-            params[self.filter_field] = self.filter_value
+        if self.filter_field is not None:
+            field = self.filter_field
+            op = self.filter_operator
+
+            if op == FilterOperator.EXISTS:
+                params[field] = ""
+
+            elif op == FilterOperator.NOT_EXISTS:
+                params[f"!{field}"] = ""
+
+            elif op in (FilterOperator.EQ, FilterOperator.REGEX):
+                # REGEX value is /pattern/flags — same key format as EQ.
+                if self.filter_value is not None:
+                    params[field] = self.filter_value
+
+            elif op in (FilterOperator.NEQ, FilterOperator.NOT_REGEX):
+                # Negation: key becomes field! so the URL reads field!=value.
+                # NOT_REGEX value is /pattern/flags — same key format as NEQ.
+                if self.filter_value is not None:
+                    params[f"{field}!"] = self.filter_value
+
+            elif op == FilterOperator.LT:
+                params[f"{field}<"] = self.filter_value  # type: ignore[assignment]
+
+            elif op == FilterOperator.GT:
+                params[f"{field}>"] = self.filter_value  # type: ignore[assignment]
+
+            elif op == FilterOperator.GTE:
+                params[f"{field}>="] = self.filter_value  # type: ignore[assignment]
+
+            elif op == FilterOperator.LTE:
+                params[f"{field}<="] = self.filter_value  # type: ignore[assignment]
 
         return params
