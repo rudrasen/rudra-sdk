@@ -20,4 +20,5 @@ lotr_sdk/scratch.json
 .vscode/
 
 # docs source not for public repo
-docs/prompt.md
+docs
+.planning/
