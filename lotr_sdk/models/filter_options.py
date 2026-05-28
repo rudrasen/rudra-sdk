@@ -1,11 +1,10 @@
 """
-FilterOptions — caller-facing model for pagination, sorting, and field filtering.
+FilterOptions — caller-facing model for pagination and field filtering.
 
-Not frozen: callers may build incrementally (e.g. set sort_by after construction).
+Not frozen: callers may build incrementally.
 
 The One API query-param conventions:
     Pagination : ?limit=N&page=N&offset=N
-    Sorting    : ?sort=<field>:<asc|desc>      e.g. ?sort=budgetInMillions:desc
     Filtering  : key format varies by operator (see table below)
 
 FilterOperator → to_query_params() key format:
@@ -20,14 +19,16 @@ FilterOperator → to_query_params() key format:
     REGEX      : {field: value}           → ?field=/pattern/flags
     NOT_REGEX  : {f"{field}!": value}     → ?field!=/pattern/flags
 
-sort_by without sort_order defaults to "asc".
 LT/GT/GTE/LTE require a numeric filter_value; validated at construction time.
+
+Known limitation: The One API returns HTTP 500 when a ?sort= parameter is
+included in the request. Sorting is therefore not supported in this SDK.
 """
 
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -68,10 +69,20 @@ class FilterOptions(BaseModel):
     page: Optional[int] = None
     offset: Optional[int] = None
     sort_by: Optional[str] = None
-    sort_order: Optional[Literal["asc", "desc"]] = None
+    sort_order: Optional[str] = None  # "asc" | "desc"
     filter_field: Optional[str] = None
     filter_value: Optional[str] = None
     filter_operator: FilterOperator = FilterOperator.EQ
+
+    @model_validator(mode="after")
+    def _reject_sort_params(self) -> "FilterOptions":
+        """Raise if sort_by or sort_order are set — the API returns HTTP 500 for ?sort=."""
+        if self.sort_by is not None or self.sort_order is not None:
+            raise ValueError(
+                "Sorting is not supported: The One API returns HTTP 500 for ?sort= queries. "
+                "Remove sort_by and sort_order from your FilterOptions."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_numeric_operator_value(self) -> "FilterOptions":
@@ -107,9 +118,8 @@ class FilterOptions(BaseModel):
     def to_query_params(self) -> dict[str, str | int]:
         """Return a dict ready to pass as ``params=`` to requests.
 
-        Only non-None values are included. Sorting is collapsed into the
-        single ``sort=field:order`` form the API expects. Filtering key format
-        varies by operator — see module docstring for the mapping.
+        Only non-None values are included. Filtering key format varies by
+        operator — see module docstring for the mapping.
         """
         params: dict[str, str | int] = {}
 
@@ -119,10 +129,6 @@ class FilterOptions(BaseModel):
             params["page"] = self.page
         if self.offset is not None:
             params["offset"] = self.offset
-
-        if self.sort_by is not None:
-            order = self.sort_order or "asc"
-            params["sort"] = f"{self.sort_by}:{order}"
 
         if self.filter_field is not None:
             field = self.filter_field
@@ -146,15 +152,19 @@ class FilterOptions(BaseModel):
                     params[f"{field}!"] = self.filter_value
 
             elif op == FilterOperator.LT:
-                params[f"{field}<"] = self.filter_value  # type: ignore[assignment]
+                assert self.filter_value is not None  # guaranteed by model_validator
+                params[f"{field}<"] = self.filter_value
 
             elif op == FilterOperator.GT:
-                params[f"{field}>"] = self.filter_value  # type: ignore[assignment]
+                assert self.filter_value is not None  # guaranteed by model_validator
+                params[f"{field}>"] = self.filter_value
 
             elif op == FilterOperator.GTE:
-                params[f"{field}>="] = self.filter_value  # type: ignore[assignment]
+                assert self.filter_value is not None  # guaranteed by model_validator
+                params[f"{field}>="] = self.filter_value
 
             elif op == FilterOperator.LTE:
-                params[f"{field}<="] = self.filter_value  # type: ignore[assignment]
+                assert self.filter_value is not None  # guaranteed by model_validator
+                params[f"{field}<="] = self.filter_value
 
         return params
