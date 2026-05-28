@@ -210,11 +210,15 @@ All list methods accept an optional `FilterOptions` for pagination, sorting, and
 **Decision:** `FilterOptions` Pydantic model with `to_query_params()` rather than bare `**kwargs`.
 
 **Reasoning:**
-1. **Validated at construction** — `sort_order="ascending"` raises immediately instead of forwarding an invalid value to the API as a confusing 400.
+1. **Validated at construction** — invalid field values raise immediately instead of forwarding a confusing 400 to the API.
 2. **Centralised serialisation** — all filter→query-string logic lives in one testable place; resources call `.to_query_params()` and never build query dicts manually.
 3. **Deterministic cache keys (v2)** — `to_query_params()` enforces three invariants required for consistent cache key construction: parameters emitted in sorted key order, `None` fields excluded, and all values coerced to `str`.
 
 **Tradeoff:** Callers construct a `FilterOptions` object rather than passing bare kwargs. IDE autocompletion compensates; there is no enforcement point for the cache-key invariants with `**kwargs`.
+
+### Known Limitation — Sorting not supported
+
+The One API returns **HTTP 500 Internal Server Error** when any `?sort=field:order` query parameter is included in a request. This was verified against the live API during development. As a result, `FilterOptions` does not expose `sort_by` or `sort_order` fields, and no sort parameter is ever sent. If the upstream API resolves this, sorting can be added as a non-breaking addition in a future version.
 
 ---
 
