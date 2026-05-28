@@ -14,7 +14,7 @@ Assumption: env-var isolation uses monkeypatch.delenv so tests do not
 import responses as resp
 import pytest
 
-from lotr_sdk import LotRClient
+from lotr_sdk import LotRClient, CacheConfig, RetryConfig
 from lotr_sdk.exceptions import APIError, AuthError, RateLimitError
 
 BASE_URL = "https://the-one-api.dev/v2"
@@ -59,6 +59,112 @@ class TestLotRClientInit:
         # We just verify construction succeeds — precedence is an internal detail.
         client = LotRClient(api_key="explicit-key")
         assert client._http._session.headers["Authorization"] == "Bearer explicit-key"
+
+
+class TestLotRClientWithDefaults:
+    def test_with_defaults_enables_cache_and_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient.with_defaults(api_key=DUMMY_KEY)
+        assert client._http._cache is not None
+        assert client._http._retry_config is not None
+
+    def test_with_defaults_uses_expected_ttl_and_attempts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient.with_defaults(api_key=DUMMY_KEY)
+        assert client._http._cache_config.ttl == 600
+        assert client._http._retry_config.max_attempts == 3
+
+    def test_with_defaults_caller_cache_config_overrides_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient.with_defaults(
+            api_key=DUMMY_KEY, cache_config=CacheConfig(ttl=1200)
+        )
+        assert client._http._cache_config.ttl == 1200
+        # retry default still applied
+        assert client._http._retry_config is not None
+
+    def test_with_defaults_caller_retry_config_overrides_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient.with_defaults(
+            api_key=DUMMY_KEY, retry_config=RetryConfig(max_attempts=5)
+        )
+        assert client._http._retry_config.max_attempts == 5
+        # cache default still applied
+        assert client._http._cache is not None
+
+    def test_with_defaults_accepts_custom_base_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient.with_defaults(
+            api_key=DUMMY_KEY, base_url="http://localhost:8080"
+        )
+        assert client._http._base_url == "http://localhost:8080"
+
+
+class TestLotRClientRepr:
+    def test_repr_contains_base_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient(api_key=DUMMY_KEY)
+        assert "the-one-api.dev" in repr(client)
+
+    def test_repr_shows_cache_enabled_when_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient(api_key=DUMMY_KEY, cache_config=CacheConfig())
+        assert "cache=enabled" in repr(client)
+
+    def test_repr_shows_cache_disabled_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient(api_key=DUMMY_KEY)
+        assert "cache=disabled" in repr(client)
+
+    def test_repr_shows_retry_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient(api_key=DUMMY_KEY, retry_config=RetryConfig())
+        assert "retry=enabled" in repr(client)
+
+    def test_repr_never_contains_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient(api_key=DUMMY_KEY)
+        assert DUMMY_KEY not in repr(client)
+        assert "Bearer" not in repr(client)
+
+
+class TestCacheConfigImmutability:
+    def test_frozen_raises_on_mutation(self) -> None:
+        from dataclasses import FrozenInstanceError
+        cfg = CacheConfig(ttl=600)
+        with pytest.raises(FrozenInstanceError):
+            cfg.ttl = 999  # type: ignore[misc]
+
+    def test_plain_dict_coerced_to_mapping_proxy(self) -> None:
+        from types import MappingProxyType
+        cfg = CacheConfig(resource_ttl={"movie": 1200})
+        assert isinstance(cfg.resource_ttl, MappingProxyType)
+        assert cfg.resource_ttl["movie"] == 1200
+
+    def test_resource_ttl_mapping_proxy_is_read_only(self) -> None:
+        cfg = CacheConfig(resource_ttl={"movie": 1200})
+        with pytest.raises(TypeError):
+            cfg.resource_ttl["quote"] = 300  # type: ignore[index]
+
+    def test_default_resource_ttl_is_empty_mapping_proxy(self) -> None:
+        from types import MappingProxyType
+        cfg = CacheConfig()
+        assert isinstance(cfg.resource_ttl, MappingProxyType)
+        assert len(cfg.resource_ttl) == 0
 
 
 class TestHTTPErrorMapping:
