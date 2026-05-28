@@ -7,6 +7,22 @@ InMemoryCache   — TTL + LRU eviction cache with thread-safe reads/writes and d
 
 The One API rate limit is 100 queries per 10 minutes (600 s). The default TTL of 600 s
 means any repeated call within that window is served from cache at zero quota cost.
+
+Why in-memory only
+------------------
+Three external backends were considered and rejected for v1:
+
+- diskcache (SQLite): the SDK would write to the caller's filesystem; schema changes
+  between SDK versions would corrupt cached bytes; disk I/O overhead is disproportionate
+  for small JSON payloads.
+- Memcached: requires running infrastructure; distributed dog-pile prevention needs CAS
+  operations, not threading.Lock.
+- Redis: same infrastructure dependency; SET NX EX solves distributed locking, but that
+  logic belongs in a caller-provided CacheProtocol implementation, not the SDK itself.
+
+No major public SDK (Stripe, boto3, Twilio, Algolia) ships an external cache backend.
+The consistent pattern is in-memory for the SDK's own concerns and a pluggable interface
+for callers who need more. CacheProtocol is that interface.
 """
 
 from __future__ import annotations
@@ -24,11 +40,26 @@ __all__ = ["CacheProtocol", "CacheConfig", "InMemoryCache"]
 
 @runtime_checkable
 class CacheProtocol(Protocol):
-    """Structural protocol for cache implementations.
+    """Structural protocol for pluggable cache backends.
 
-    Any class that provides these four methods satisfies the protocol without
-    inheriting from this module. Use it for custom backends (Redis, Memcached)
-    or in ``isinstance`` checks.
+    ``HTTPClient`` accepts a ``CacheProtocol``, not a concrete cache class. This
+    means callers can supply Redis, Memcached, or any other backend without
+    changing the resource API — only the object passed to the client changes.
+
+    Any class that implements these four methods satisfies the protocol without
+    inheriting from this module. The ``@runtime_checkable`` decorator allows
+    ``isinstance(obj, CacheProtocol)`` checks at runtime.
+
+    To add an external backend, implement these four methods and pass an instance
+    to ``LotRClient`` via the ``cache`` parameter::
+
+        class RedisCache:
+            def get(self, key: str) -> Any | None: ...
+            def set(self, key: str, value: Any, ttl: int) -> None: ...
+            def delete(self, key: str) -> None: ...
+            def clear(self) -> None: ...
+
+        client = LotRClient(api_key="...", cache=RedisCache(...))
     """
 
     def get(self, key: str) -> Any | None: ...
@@ -44,14 +75,19 @@ class CacheProtocol(Protocol):
 class CacheConfig:
     """Immutable configuration for the in-memory cache.
 
-    ``frozen=True`` prevents post-construction mutation. Both ``InMemoryCache``
-    and ``HTTPClient`` hold a reference to the same config object; a mutable
-    config would allow silent divergence if a caller changed ``ttl`` after the
-    client was built — new cache entries would use the updated value while
-    ``HTTPClient._effective_ttl()`` might see a different value depending on
-    read timing. Freezing makes any mutation attempt a ``FrozenInstanceError``
-    at the exact point of the offending assignment rather than a silent
-    inconsistency later.
+    Why frozen
+    ----------
+    Both ``InMemoryCache`` and ``HTTPClient`` hold a reference to the same config
+    instance. If ``ttl`` could be changed after construction, new cache entries would
+    use the updated value while ``HTTPClient._effective_ttl()`` might read a different
+    value depending on timing — a silent inconsistency with no obvious failure point.
+    ``frozen=True`` turns any mutation attempt into a ``FrozenInstanceError`` at the
+    exact point of the offending assignment.
+
+    ``frozen=True`` alone does not protect mutable fields: a plain ``dict`` attribute
+    can still be mutated in-place even on a frozen dataclass
+    (``config.resource_ttl["movie"] = 999`` would succeed). ``MappingProxyType`` closes
+    that gap. A ``__post_init__`` coerces any caller-supplied ``dict`` automatically.
 
     Args:
         ttl:          Base time-to-live in seconds. Default 600 matches the API's
@@ -59,7 +95,7 @@ class CacheConfig:
                       within a single quota window.
         jitter:       Fraction of ``ttl`` added as positive random noise.
                       ``actual_ttl = ttl + uniform(0, ttl * jitter)``.
-                      Prevents a burst of simultaneous expirations (thundering herd).
+                      Prevents a burst of simultaneous expirations.
         maxsize:      Maximum number of entries before LRU eviction begins.
         resource_ttl: Per-resource TTL overrides keyed by API resource name
                       (e.g. ``{"movie": 1200, "quote": 300}``). A plain ``dict``
@@ -93,22 +129,56 @@ class _CacheEntry:
 class InMemoryCache:
     """Thread-safe TTL + LRU in-memory cache.
 
-    Thread safety model:
-    - ``_lock`` (RLock): guards all reads and writes to ``_store``. Never held
-      during network I/O — the HTTPClient releases the key-level lock before
-      sleeping on retry, and the global RLock is only held for brief dict ops.
-    - Dog-pile prevention lives in ``HTTPClient``, not here: the client acquires
-      a per-key threading.Lock before making the HTTP call, double-checks the
-      cache, and only fetches if the entry is still absent.
+    Jitter and simultaneous expiry
+    --------------------------------
+    Without TTL jitter, entries written during the same burst would all expire at the
+    same moment. Every thread that held a stale key would miss simultaneously, issue
+    parallel API calls, and recreate the burst that just filled the cache. Spreading
+    expiry times eliminates this pattern.
 
-    Jitter:
-    ``actual_ttl = base_ttl + jitter_fn(0, base_ttl * config.jitter)``
-    Positive-only — no entry expires before ``base_ttl`` seconds.
+    The actual TTL for each entry is:
 
-    LRU eviction:
-    Entries are stored in an ``OrderedDict``; the MRU end is the right (``last=True``).
-    On access, the entry is moved to the right. When ``maxsize`` is reached, the
-    leftmost entry (LRU) is popped before inserting the new one.
+        actual_ttl = base_ttl + jitter_fn(0, base_ttl * config.jitter)
+
+    Positive-only jitter guarantees no entry expires before ``base_ttl`` seconds. The
+    average TTL is ``base_ttl * (1 + jitter/2)`` — slightly longer than configured,
+    which is acceptable.
+
+    Thread safety
+    -------------
+    Module-level ``LotRClient`` instances are the standard pattern for long-running
+    processes (Django/Flask apps initialise at startup and share the client across
+    request threads). Without locking, concurrent ``OrderedDict`` reads and writes
+    produce silent data corruption.
+
+    Two locks coordinate access:
+
+    - ``_lock`` (``RLock``): guards all reads and writes to ``_store``. Never held
+      during network I/O — the HTTPClient releases the key-level lock before sleeping
+      on retry, and the global RLock is held only for brief dict operations.
+    - Per-key ``Lock`` (managed by HTTPClient): prevents the situation where multiple
+      threads miss the same cache key simultaneously and all issue API calls.
+
+    Locking order (deadlock prevention): global ``RLock`` acquired first, per-key
+    ``Lock`` acquired second. This order is never reversed.
+
+    Dog-pile prevention sequence
+    ----------------------------
+    1. Thread A misses → acquires per-key lock.
+    2. Thread B misses → blocks on the same per-key lock.
+    3. Thread A fetches from the API → writes to cache → releases per-key lock.
+    4. Thread B acquires → re-checks cache → hits → returns without an API call.
+
+    Known gap: the global ``RLock`` serialises concurrent reads. Upgrading to a
+    reader-writer lock would allow concurrent reads to proceed in parallel while keeping
+    writes exclusive. Planned for a future version.
+
+    LRU eviction
+    ------------
+    Entries are stored in an ``OrderedDict``; the most-recently-used end is the right
+    (``last=True``). On access, the entry moves to the right. When ``maxsize`` is
+    reached, the leftmost entry (least-recently-used) is popped before inserting
+    the new one.
 
     Args:
         config:     Cache configuration.

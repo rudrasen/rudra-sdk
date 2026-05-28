@@ -1,29 +1,79 @@
 # SDK Design — LOTR SDK
 
-A Python SDK for The One API (Lord of the Rings data). Architecture decisions, rationale, and tradeoffs for contributors and reviewers.
+---
+
+## Table of Contents
+
+1. [Purpose](#1-purpose)
+2. [Design Goals and Scope](#2-design-goals-and-scope)
+3. [Architecture](#3-architecture)
+4. [Public API](#4-public-api)
+5. [Resource and Model Abstractions](#5-resource-and-model-abstractions)
+6. [Data Models](#6-data-models)
+7. [Request Flow](#7-request-flow)
+8. [Authentication](#8-authentication)
+9. [Filtering and Pagination](#9-filtering-and-pagination)
+10. [Error Handling and Retry](#10-error-handling-and-retry)
+11. [Caching Strategy](#11-caching-strategy)
+12. [Testing Strategy](#12-testing-strategy)
+13. [Maintainability and Security](#13-maintainability-and-security)
+14. [Roadmap and Extensibility](#14-roadmap-and-extensibility)
 
 ---
 
-## 1. Goals and Scope
+## 1. Purpose
 
-**In scope (v1):**
-- Five read-only endpoints: `GET /movie`, `/movie/{id}`, `/movie/{id}/quote`, `GET /quote`, `/quote/{id}`
-- Synchronous HTTP via `requests.Session`
-- Pagination, sorting, and field filtering via `FilterOptions`
+This SDK provides a Python interface for The One API's movie and quote endpoints. The goal is to make the API easy for Python developers to use while keeping the implementation maintainable, testable, and extensible.
+
+The SDK covers five endpoints:
+
+    GET /movie
+    GET /movie/{id}
+    GET /movie/{id}/quote
+    GET /quote
+    GET /quote/{id}
+
+---
+
+## 2. Design Goals and Scope
+
+1. Provide a small, discoverable public API.
+2. Hide HTTP details from SDK users.
+3. Return typed Python objects instead of raw dictionaries.
+4. Support filtering and pagination consistently.
+5. Provide predictable, SDK-specific errors.
+6. Keep the v1 implementation simple while leaving room for future endpoints.
+7. Support reliable local testing without real network calls.
+
+**In scope:**
+- Synchronous HTTP
+- Pagination and field filtering
 - SDK-specific exception hierarchy with centralised status-code mapping
-- In-memory TTL cache with LRU eviction, jitter, and dog-pile prevention (`CacheProtocol`, `CacheConfig`, `InMemoryCache`)
-- Retry with exponential backoff, ±50% jitter, and `max_wait` ceiling (`RetryConfig`)
+- In-memory TTL cache with LRU eviction, jitter, and dog-pile prevention
+- Retry with exponential backoff, ±50% jitter, and a `max_wait` ceiling
+- Package structure that lets additional API resources be added using the existing client pattern
 
 **Explicitly out of scope:**
+- CLI
 - Async client (httpx/aiohttp)
 - External cache backends (Redis, Memcached, diskcache)
 - Additional endpoints (`/book`, `/chapter`, `/character`)
-- CLI entry point
 - Proactive rate-limit quota tracking or token-bucket throttling
 
 ---
 
-## 2. Architecture Diagram
+## 3. Architecture
+
+The SDK separates into four main layers:
+
+| Layer | Responsibility |
+| --- | --- |
+| `LotRClient` | Public entry point and resource container |
+| `resources/` | Domain-specific API operations |
+| `http.py` | Transport, auth, status handling, retries, cache integration |
+| `models/` | Typed response and filter models |
+
+This keeps public API ergonomics separate from HTTP implementation details.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -70,7 +120,98 @@ A Python SDK for The One API (Lord of the Rings data). Architecture decisions, r
                           └──────────────────────────────┘
 ```
 
-### Request Flow
+---
+
+## 4. Public API
+
+The SDK exposes two namespaced resources:
+
+```python
+# Movies
+client.movies.list(filters: FilterOptions | None = None) -> ListResponse[Movie]
+client.movies.get(movie_id: str) -> Movie
+client.movies.quotes(movie_id: str, filters: FilterOptions | None = None) -> ListResponse[Quote]
+
+# Quotes
+client.quotes.list(filters: FilterOptions | None = None) -> ListResponse[Quote]
+client.quotes.get(quote_id: str) -> Quote
+```
+
+---
+
+## 5. Resource and Model Abstractions
+
+### Namespaced resources
+
+**Decision:** `client.movies.*` and `client.quotes.*` namespaces rather than flat methods on the client.
+
+**Reasoning:** Namespacing is self-documenting. A caller who discovers `client.movies` immediately knows all movie operations live there. A flat API (`client.list_movies()`, `client.get_quote()`) requires scanning a full method list to understand how operations are grouped.
+
+**Tradeoff:** One resource class per domain adds a layer of indirection. At five endpoints across two resources, the overhead is negligible. Future endpoints such as `client.books` or `client.characters` become additive and non-breaking.
+
+---
+
+### Resources vs models
+
+The SDK separates **resources** (behaviour) from **models** (data).
+
+- A resource knows how to talk to the API: `client.movies.get(id)`, `client.movies.list()`.
+- A model holds the returned data: `Movie`, `Quote`, `ListResponse[Movie]`.
+
+**Decision:** Models do not make network calls. `Movie` does not fetch itself; `Quote` does not call the API. Network behaviour belongs in resources and `HTTPClient`.
+
+**Reasoning:** This keeps models as immutable data snapshots and avoids mixing transport concerns into response objects.
+
+**Tradeoff:** Callers must use the client to fetch related data:
+
+```python
+quotes = client.movies.quotes(movie.id)
+```
+
+rather than `movie.quotes()`. This is intentional — the SDK stays explicit about when network calls happen.
+
+---
+
+## 6. Data Models
+
+**Decision:** The SDK returns frozen Pydantic models instead of raw JSON dictionaries.
+
+```python
+class Movie(BaseModel):
+    id: str
+    name: str
+    runtime_in_minutes: int
+    budget_in_millions: float
+    box_office_revenue_in_millions: float
+    academy_award_nominations: int
+    academy_award_wins: int
+    rotten_tomatoes_score: float
+```
+
+The API returns camelCase fields such as `runtimeInMinutes`. The SDK exposes snake_case equivalents such as `runtime_in_minutes`.
+
+**Reasoning:**
+- Typed models improve developer experience, enable IDE autocomplete, and surface unexpected API response changes early.
+- API responses are facts, not mutable state. A `Movie` is a point-in-time snapshot; allowing mutation creates objects that silently diverge from the API's truth.
+- Frozen Pydantic models are hashable — a prerequisite for cache key construction in future versions.
+
+**Tradeoff:**
+- Strict parsing means an upstream API shape change raises a validation error. This is preferable to silently returning malformed data.
+- Tests cannot patch model fields directly (`movie.name = "test"`). Tests must construct instances via the constructor or load from fixture JSON, which is the correct approach regardless.
+
+---
+
+### Foreign keys, not nested objects
+
+**Decision:** The `movie` and `character` fields on quotes are surfaced as `movie_id` and `character_id` (ID strings), not resolved nested objects.
+
+**Reasoning:** v1 is intentionally stateless. The in-scope endpoints return IDs; eagerly resolving them requires extra API calls the SDK was not asked to make, and would entangle the SDK with relationship state it cannot manage.
+
+**Tradeoff:** Callers must resolve relationships themselves. Accepted for a read-only, stateless v1 SDK.
+
+---
+
+## 7. Request Flow
 
 ```
 resource.list(filters)
@@ -98,164 +239,54 @@ HTTPClient.get(path, params)
 
 ---
 
-## 3. Public API
+## 8. Authentication
+
+The SDK uses bearer token authentication. The token resolves in this order:
+
+**Constructor `api_key` arg → `LOTR_API_KEY` env var.** The first non-empty value wins. Loading a `.env` file is the caller's responsibility — call `python-dotenv.load_dotenv()` before constructing the client.
+
+**Decision:** Fail fast if no API key is available.
+
+**Reasoning:** Authentication failure should be visible at client construction time, not delayed until the first API call. Lazy validation hides misconfiguration in a non-obvious location. Fail-fast surfaces it at the earliest possible point — object construction — which is the pattern used by boto3, the Stripe SDK, and Twilio.
+
+**Tradeoff:** Tests must supply a dummy API key even when HTTP calls are mocked. This is acceptable because it keeps production behaviour explicit.
+
+---
+
+## 9. Filtering and Pagination
+
+### FilterOptions
+
+Filtering uses a `FilterOptions` model rather than loose keyword arguments:
 
 ```python
-# Movies
-client.movies.list(filters: FilterOptions | None = None) -> ListResponse[Movie]
-client.movies.get(movie_id: str) -> Movie
-client.movies.quotes(movie_id: str, filters: FilterOptions | None = None) -> ListResponse[Quote]
-
-# Quotes
-client.quotes.list(filters: FilterOptions | None = None) -> ListResponse[Quote]
-client.quotes.get(quote_id: str) -> Quote
+filters = FilterOptions(limit=10, page=1)
+movies = client.movies.list(filters=filters)
 ```
 
-All list methods accept an optional `FilterOptions` for pagination, sorting, and field filtering. All methods raise from the `LotRError` hierarchy on failure.
+`FilterOptions.to_query_params()` converts the model into deterministic query parameters.
+
+**Decision:** A dedicated `FilterOptions` model instead of `**kwargs`.
+
+**Reasoning:** A dedicated model centralises validation, documentation, and query-string serialisation. It enforces three invariants that keep cache keys stable:
+
+1. **Validated at construction** — invalid values raise immediately instead of forwarding a confusing 400 to the API.
+2. **Centralised serialisation** — all filter-to-query-string logic lives in one testable place; resources call `.to_query_params()` and never build query dicts manually.
+3. **Deterministic cache keys** — parameters emit in sorted key order, `None` fields are excluded, and all values are coerced to `str`. The same filters always produce the same cache key.
+
+**Tradeoff:** Callers write slightly more code than passing bare keyword arguments. IDE autocompletion compensates.
 
 ---
 
-### Production Defaults Factory
+### Known limitation — sorting not supported
 
-**Decision:** `LotRClient.with_defaults()` classmethod pre-configures `CacheConfig(ttl=600, jitter=0.1)` and `RetryConfig(max_attempts=3, backoff_factor=1.0)`.
-
-**Reasoning:** The primary constructor is intentionally minimal — no cache, no retry — so short-lived scripts and notebooks don't pay for what they don't need. However, a first-time user building a production integration must know to import two separate configuration classes, understand what values to set, and understand why. A named factory removes that cognitive load without changing the default constructor behaviour. Explicitly provided `cache_config` or `retry_config` arguments override the defaults, so the factory isn't a straitjacket.
-
-The classmethod pattern follows Python stdlib convention (`dict.fromkeys`, `datetime.fromtimestamp`, `Path.cwd`) and is idiomatic for "alternative constructor with opinionated defaults."
-
-**Tradeoff:** Two ways to construct the client. New contributors may ask which to use. The answer is: `with_defaults()` for production services; `LotRClient()` when you need explicit control or are writing scripts/tests.
-
-**Alternatives considered:**
-
-| Alternative | Why rejected |
-|---|---|
-| Change primary constructor defaults to enable cache + retry | Breaking change for callers relying on current behaviour; surprising to allocate memory on a bare `LotRClient()` |
-| `preset: Literal["minimal", "production"]` parameter | Mixes factory concern into the constructor; "minimal" and "production" are vague labels that resist precise documentation |
+The One API returns HTTP 500 when any `?sort=field:order` parameter is included. This was verified against the live API during development. `FilterOptions` does not expose `sort_by` or `sort_order`, and no sort parameter is ever sent. If the upstream API fixes this, sorting can be added as a non-breaking addition.
 
 ---
 
-### `__repr__`
+### Known limitation — `/movie/{id}/quote` only works for the LotR trilogy
 
-**Decision:** `LotRClient.__repr__` returns a log-safe string showing `base_url`, `timeout`, and cache/retry status (`"enabled"` or `"disabled"`). The API key is never included.
-
-**Reasoning:** Without `__repr__`, every REPL session and debugger inspection of a client returns `<lotr_sdk.client.LotRClient object at 0x...>`, which gives no signal about whether caching or retry is active. This matters when debugging "why isn't this instance caching?" in production.
-
-The config state is stored directly on `LotRClient` at construction time (four scalar attributes) rather than being read back through `self._http._cache_config`. Piercing through `HTTPClient`'s private attributes would create tight coupling between `__repr__` and `HTTPClient`'s internal structure — any refactor of `HTTPClient` internals would silently break the repr. Storing on `self` keeps the repr contract independent.
-
-**Security invariant:** `__repr__` must be safe to emit in logs. The Bearer token is therefore explicitly excluded and the implementation accesses no path that could reach `_session.headers`. This is a structural guarantee, not a documentation note — the repr attributes are populated before the `HTTPClient` is constructed, so there is no reference path from them to the credential.
-
-**Tradeoff:** Four extra scalar attributes per client instance (`_repr_base_url`, `_repr_timeout`, `_repr_cache`, `_repr_retry`). Memory cost is negligible; clarity of the repr/security boundary is the gain.
-
----
-
-## 4. Resource and Model Abstractions
-
-### Namespaced Resources
-
-**Decision:** `client.movies.*` and `client.quotes.*` namespaces rather than flat methods on the client.
-
-**Reasoning:** Namespacing is self-documenting. A caller who discovers `client.movies` immediately knows all movie operations live there. A flat API (`client.list_movies()`, `client.get_quote()`) requires scanning a full method list to understand how operations are grouped.
-
-**Tradeoff:** One resource class per domain adds a layer of indirection. At 5 endpoints across 2 resources, the overhead is negligible.
-
----
-
-### Pydantic v2 Frozen Models
-
-**Decision:** All response models use `ConfigDict(frozen=True)`.
-
-**Reasoning:**
-- API responses are facts, not mutable state. A `Movie` object is a point-in-time snapshot; allowing mutation creates objects that silently diverge from the API's truth.
-- Frozen Pydantic models are hashable — a prerequisite for cache key construction and set membership in v2.
-
-**Tradeoff:** Tests cannot patch model fields directly (`movie.name = "test"`). Tests must construct instances via the constructor or load from fixture JSON, which is the correct approach regardless.
-
----
-
-### Foreign Keys vs Nested Objects
-
-**Decision:** The `movie` and `character` API fields on quotes are surfaced as `movie_id` and `character_id` (ID strings), not resolved nested objects.
-
-**Reasoning:** v1 is intentionally stateless. The in-scope endpoints return IDs; eagerly resolving them requires additional API calls the SDK was not asked to make, and would entangle the SDK with relationship state it cannot manage.
-
-**Tradeoff:** Callers must resolve relationships themselves. Accepted for a read-only, stateless v1 SDK.
-
----
-
-## 5. HTTP Layer
-
-### Single Shared Session
-
-**Decision:** One `requests.Session` constructed at `LotRClient.__init__`, shared across both resources.
-
-**Reasoning:** Connection pooling is per-session. Sharing amortises TCP handshake cost across all calls during the client's lifetime. The `Authorization` header is set once at construction and never modified, making concurrent reads safe.
-
-**Tradeoff:** None significant for a sync, read-only SDK.
-
----
-
-### Synchronous Only
-
-**Decision:** `requests.Session`, blocking I/O. No async in v1.
-
-**Reasoning:** The 5 in-scope endpoints are simple read-only lookups. Async doubles the client interface surface (sync + async variants), adds `httpx` as a dependency, and provides no benefit to single-call callers. Performance concerns are addressed by the v2 cache.
-
-**Tradeoff:** Blocks the calling thread per API call when the cache is cold. Accepted for v1.
-
----
-
-### Status → Exception Mapping
-
-**Decision:** All HTTP status → SDK exception translation lives exclusively in `HTTPClient._raise_for_status()` in `http.py`.
-
-**Reasoning:** A single function is auditable in one place and guarantees consistent error behavior across all resources. Distributing this logic across resource files creates inconsistency risk with no offsetting benefit.
-
-| Status | Exception | Retried? |
-|--------|-----------|----------|
-| 401 | `AuthError` | Never — hardcoded |
-| 404 | `NotFoundError` | Never — hardcoded |
-| 429 | `RateLimitError` | Yes, via `RetryConfig` |
-| 5xx | `APIError` | Yes, via `RetryConfig` |
-| other 4xx | `APIError` | No |
-| network failure | `APIError(status_code=0)` | No |
-| parse failure | `ValidationError` | No |
-
----
-
-## 6. Authentication
-
-**Decision:** Bearer token via `Authorization` header; `LotRClient.__init__` raises `AuthError` immediately if neither `api_key` constructor arg nor `LOTR_API_KEY` env var provides a non-empty value.
-
-**Reasoning:** Lazy auth validation (accepting a keyless client and failing on the first call) delays misconfiguration to a non-obvious location. Fail-fast surfaces it at the earliest possible point: object construction. This is the pattern used by boto3, Stripe SDK, and Twilio.
-
-**Tradeoff:** Cannot construct a `LotRClient` without a credential even in tests where HTTP is mocked. Mitigation: pass any non-empty dummy string (`"test"`) — the `responses` library intercepts before the real API sees it.
-
-**Resolution order:** Constructor `api_key` arg → `LOTR_API_KEY` env var. First non-empty value wins. `.env` file loading is the caller's responsibility (call `python-dotenv.load_dotenv()` before constructing the client).
-
----
-
-## 7. Filtering and Pagination
-
-### FilterOptions Model
-
-**Decision:** `FilterOptions` Pydantic model with `to_query_params()` rather than bare `**kwargs`.
-
-**Reasoning:**
-1. **Validated at construction** — invalid field values raise immediately instead of forwarding a confusing 400 to the API.
-2. **Centralised serialisation** — all filter→query-string logic lives in one testable place; resources call `.to_query_params()` and never build query dicts manually.
-3. **Deterministic cache keys (v2)** — `to_query_params()` enforces three invariants required for consistent cache key construction: parameters emitted in sorted key order, `None` fields excluded, and all values coerced to `str`.
-
-**Tradeoff:** Callers construct a `FilterOptions` object rather than passing bare kwargs. IDE autocompletion compensates; there is no enforcement point for the cache-key invariants with `**kwargs`.
-
-### Known Limitation — Sorting not supported
-
-The One API returns **HTTP 500 Internal Server Error** when any `?sort=field:order` query parameter is included in a request. This was verified against the live API during development. As a result, `FilterOptions` does not expose `sort_by` or `sort_order` fields, and no sort parameter is ever sent. If the upstream API resolves this, sorting can be added as a non-breaking addition in a future version.
-
-### Known Limitation — `/movie/{id}/quote` only works for the LotR trilogy
-
-The One API only stores quote data for the three core Lord of the Rings trilogy films. Calling `GET /movie/{id}/quote` with any other movie ID (e.g. The Hobbit films) returns a valid `200 OK` with an empty `docs` array — it does not raise a 404. The SDK surfaces this faithfully: `client.movies.quotes(movie_id)` returns a `ListResponse[Quote]` with `docs = []` for non-trilogy IDs.
-
-The three movie IDs that have quote data:
+The One API only stores quote data for the three core Lord of the Rings films. Calling `GET /movie/{id}/quote` with any other movie ID returns a valid `200 OK` with an empty `docs` array. The SDK surfaces this faithfully: `client.movies.quotes(movie_id)` returns a `ListResponse[Quote]` with `docs = []` for non-trilogy IDs.
 
 | Movie | ID |
 |---|---|
@@ -263,22 +294,38 @@ The three movie IDs that have quote data:
 | The Two Towers | `5cd95395de30eff6ebccde5b` |
 | The Return of the King | `5cd95395de30eff6ebccde5d` |
 
-**SDK behaviour:** No special-casing is applied. The SDK passes the request through and returns whatever the API responds with. Callers who need to guard against empty results can check `response.total == 0` or `len(response.docs) == 0`.
+No special-casing is applied. Callers who need to guard against empty results can check `response.total == 0` or `len(response.docs) == 0`.
 
 ---
 
-### Field Filtering
+### Pagination
 
-**Decision:** `FilterOperator` enum covering EQ, NEQ, LT, GT, GTE, LTE, EXISTS, NOT_EXISTS, REGEX, NOT_REGEX.
+`ListResponse[T]` preserves pagination metadata alongside the results:
 
-**Reasoning:** These map directly to The One API's query filter syntax. An enum prevents typos and enables Pydantic to validate operator–value combinations at construction time — LT/GT/GTE/LTE reject non-numeric `filter_value` before any HTTP call is made.
+```python
+class ListResponse(Generic[T]):
+    docs: list[T]
+    total: int
+    limit: int
+    offset: int
+    page: int
+    pages: int
+```
+
+The SDK does not flatten list responses into `list[Movie]` because callers may need the pagination metadata.
+
+---
+
+### Field filtering
+
+**Decision:** `FilterOperator` enum covering `EQ`, `NEQ`, `LT`, `GT`, `GTE`, `LTE`, `EXISTS`, `NOT_EXISTS`, `REGEX`, `NOT_REGEX`.
+
+**Reasoning:** These map directly to The One API's query filter syntax. An enum prevents typos and lets Pydantic validate operator–value combinations at construction time — `LT`/`GT`/`GTE`/`LTE` reject non-numeric `filter_value` before any HTTP call is made.
 
 **Tradeoff:** Callers must learn the enum rather than writing raw query strings. The validation and discoverability benefit outweighs this cost.
 
-**Operator → query param mapping:**
-
-| Operator | Query key | Example URL |
-|----------|-----------|-------------|
+| Operator | Query key | Example |
+|----------|-----------|---------|
 | `EQ` | `field` | `?name=The Hobbit` |
 | `NEQ` | `field!` | `?name!=The Hobbit` |
 | `LT` | `field<` | `?runtimeInMinutes<120` |
@@ -290,36 +337,36 @@ The three movie IDs that have quote data:
 | `REGEX` | `field` | `?name=/the/i` |
 | `NOT_REGEX` | `field!` | `?name!=/the/i` |
 
-EQ with a comma-separated value produces inclusion matching (`name=The Hobbit,The Two Towers`). NEQ produces exclusion. No separate IN/NIN operators are needed — the value format drives that server-side behaviour.
+`EQ` with a comma-separated value produces inclusion matching (`name=The Hobbit,The Two Towers`). `NEQ` produces exclusion. No separate `IN`/`NIN` operators are needed — the value format drives that server-side behaviour.
 
 ---
 
-## 8. Error Handling
+## 10. Error Handling and Retry
 
-### Exception Hierarchy
+### Exception hierarchy
 
 ```
 LotRError (base — catch all SDK errors in one block)
 ├── AuthError          HTTP 401 — bad or missing token; never retried
 ├── NotFoundError      HTTP 404 — carries resource_id; never retried
 ├── RateLimitError     HTTP 429 — carries retry_after (seconds from Retry-After header)
-├── APIError           HTTP 5xx, other 4xx, network failure — carries status_code (0 = network)
-└── ValidationError    Pydantic parse failure — __cause__ holds original pydantic.ValidationError
+├── APIError           HTTP 5xx, other 4xx, network failure
+└── ValidationError    Pydantic parse failure
 ```
 
-**Decision:** SDK-specific hierarchy rooted at `LotRError`, independent of `requests` exceptions.
+**Decision:** Map HTTP errors and `requests` exceptions to SDK-specific exceptions.
 
-**Reasoning:** Callers should not need to know which HTTP library the SDK uses internally. `LotRError` as catch-all gives callers a single stable type; specific subclasses enable targeted handling (e.g., back off only on `RateLimitError`).
+**Reasoning:** SDK users should not need to know the internals of `requests` or inspect HTTP status codes manually. They can catch `LotRError` for all SDK failures, or catch specific subclasses when needed.
 
-**Tradeoff:** One more exception hierarchy to understand. The clean library boundary is worth it.
+**Tradeoff:** One more exception hierarchy to learn. The benefit is a cleaner, more stable caller experience.
 
-**Why 401 and 404 are never retried:** The same credential produces the same 401 on every attempt; the same ID produces the same 404. Retrying either is semantically incorrect and wastes quota. This is hardcoded in `HTTPClient` and cannot be overridden via `RetryConfig`.
+**Why 401 and 404 are never retried:** The same credential produces the same 401 on every attempt; the same ID produces the same 404. Retrying either wastes quota without any chance of success. This is hardcoded in `HTTPClient` and cannot be overridden via `RetryConfig`.
 
 ---
 
-### 8.1 Retry, Timeout, and Rate Limit Strategy
+### Retry
 
-**RetryConfig:**
+Retry behaviour is optional and configured through `RetryConfig`:
 
 ```python
 @dataclass
@@ -327,14 +374,14 @@ class RetryConfig:
     max_attempts: int = 3
     backoff_factor: float = 1.0
     retry_on: list[int] = field(default_factory=lambda: [429, 500, 502, 503])
-    max_wait: float = 60.0          # hard ceiling on any single sleep (seconds)
+    max_wait: float = 60.0  # hard ceiling on any single sleep (seconds)
 ```
 
 **Decision:** Optional `RetryConfig` at client init; if absent, the client makes exactly one attempt.
 
-**Reasoning:** Not all callers need retry logic (scripts, notebooks, one-shot tools). Imposing automatic retries on every caller masks transient errors that the caller's own orchestration handles. Opt-in keeps the simple path simple.
+**Reasoning:** Not all callers need retry logic (scripts, notebooks, one-shot tools). Forcing automatic retries on every caller masks transient errors that the caller's own orchestration already handles. Opt-in keeps the simple path simple.
 
-**Tradeoff:** Without `RetryConfig`, a transient 429 or 503 is surfaced immediately as an exception the caller must handle.
+**Tradeoff:** Without `RetryConfig`, a transient 429 or 503 surfaces immediately as an exception the caller must handle.
 
 ---
 
@@ -345,8 +392,8 @@ sleep = min(backoff_factor * 2^(attempt-1) * uniform(0.5, 1.5), max_wait)
 ```
 
 - **Exponential base** — doubles the wait on each consecutive failure, giving the server progressively more recovery time.
-- **±50% jitter** — multiplies the base by `uniform(0.5, 1.5)` so concurrent callers that fail at the same moment do not retry in lock-step. Without jitter, all threads wake simultaneously and reproduce the thundering herd that triggered the error.
-- **`max_wait` ceiling (default 60 s)** — hard cap on any single sleep. Without it, a server returning `Retry-After: 86400` would block the calling thread for 24 hours with no escape. 60 s is chosen as a value that prevents runaway blocking while still giving the server time to recover from typical transient failures. Callers who need to honour large `Retry-After` windows (e.g. the API's 10-minute quota reset) should set `max_wait=600` or `max_wait=float("inf")`.
+- **±50% jitter** — randomises the wait so concurrent callers that fail at the same moment do not retry in lock-step, which would recreate the same burst that caused the error.
+- **`max_wait` ceiling (default 60 s)** — caps any single sleep. Without it, a server returning `Retry-After: 86400` would block the thread for 24 hours. Callers who need to honour large `Retry-After` windows should set `max_wait=600` or `max_wait=float("inf")`.
 
 **429 with `Retry-After` present:**
 
@@ -354,34 +401,25 @@ sleep = min(backoff_factor * 2^(attempt-1) * uniform(0.5, 1.5), max_wait)
 sleep = min(retry_after, max_wait)
 ```
 
-Jitter is not applied to server-supplied waits — the `Retry-After` value already reflects the server's actual quota reset time, so adding noise would only cause premature retries. The `max_wait` cap still applies so the caller is not blocked longer than configured.
-
-**Default values and their rationale:**
-
-| Field | Default | Rationale |
-|---|---|---|
-| `max_attempts` | `3` | One real call plus two retries; covers most transient failures without excessive latency |
-| `backoff_factor` | `1.0` | Base sleeps of 1 s, 2 s (before jitter); low enough for interactive use, high enough for transient recovery |
-| `max_wait` | `60.0 s` | Prevents thread blocking beyond one minute; callers targeting the API's 10-min quota window should raise this |
-| `retry_on` | `[429, 500, 502, 503]` | Covers rate limiting and the most common server-side transient errors; excludes 401/404 (semantic errors, never transient) |
+Jitter is not applied to server-supplied waits — `Retry-After` already reflects the server's actual quota reset time, and adding noise would only cause premature retries. The `max_wait` cap still applies.
 
 ---
 
-**Rate limit handling:**
+### Rate limiting
 
-**Decision:** Reactive only — 429 raises `RateLimitError` with `retry_after` populated from the `Retry-After` response header.
+**Decision:** Reactive only — 429 raises `RateLimitError` with `retry_after` populated from the `Retry-After` header.
 
-**Reasoning:** Proactive throttling (token bucket, leaky bucket) requires knowing the caller's quota tier, which is only available after the first 429. Reactive handling via `RetryConfig` backoff is sufficient; the v2 cache further reduces the frequency of calls that can hit rate limits.
+**Reasoning:** Proactive throttling requires knowing the caller's quota tier upfront, which is only discoverable after the first 429. Reactive handling via `RetryConfig` backoff is sufficient; the cache reduces the frequency of calls that can hit rate limits.
 
 **Tradeoff:** The first call that exceeds the rate limit always fails. No pre-emptive protection. Accepted for v1.
 
-**Cache interaction on 429 (v2):** When a 429 is received, the TTL of all currently cached entries will be extended to cover at least the retry backoff window. This prevents a compounding failure where entries expire during backoff, triggering new calls that immediately 429 again.
+**Cache interaction on 429:** When a 429 is received, the TTL of all cached entries extends to cover at least the retry backoff window. This prevents a cascade where entries expire during backoff and trigger new calls that immediately 429 again.
 
 ---
 
-**Timeout:**
+### Timeout
 
-**Decision:** Single `timeout` integer (connection + read combined) at `LotRClient(timeout=N)`, default 10s. Network-level failures are caught and re-raised as `APIError(status_code=0)`.
+**Decision:** Single `timeout` integer (connection + read combined) at `LotRClient(timeout=N)`, default 10 s. Network-level failures are caught and re-raised as `APIError(status_code=0)`.
 
 **Reasoning:** `requests` applies the same value to both connection and read phases when passed as a single integer. Separate timeouts add configuration surface with no practical v1 benefit.
 
@@ -389,155 +427,86 @@ Jitter is not applied to server-supplied waits — the `Retry-After` value alrea
 
 ---
 
-## 9. Caching Strategy
+## 11. Caching Strategy
 
-### Design
-
-**Decision:** Optional in-memory TTL cache with LRU eviction, disabled by default. Callers opt in via `CacheConfig`.
+The SDK supports optional in-memory TTL caching, disabled by default. Callers opt in by passing a `CacheConfig` at client construction.
 
 ```python
 @dataclass
 class CacheConfig:
-    ttl: int = 600             # seconds before entry expires; matches the API's 10-min rate-limit window
-    jitter: float = 0.1        # max fraction of TTL added as positive noise (0–10%)
+    ttl: int = 600             # seconds before entry expires
+    jitter: float = 0.1        # max fraction of TTL added as random noise
     maxsize: int = 256          # LRU eviction when exceeded
     resource_ttl: dict[str, int] = field(default_factory=dict)  # per-resource TTL override
 ```
 
-**Reasoning:** The LoTR dataset is static; caching trades memory for reduced API calls and rate-limit exposure. In-memory requires no external infrastructure and covers the majority of use cases (scripts, single-process web apps, notebooks).
+**Decision:** In-memory TTL cache with LRU eviction, disabled by default.
 
-**Tradeoff:** Not shared across processes. A multi-worker deployment has independent caches per worker. `CacheProtocol` is the escape hatch.
+**Reasoning:** The LoTR dataset is static; caching trades memory for fewer API calls and less rate-limit exposure. In-memory caching requires no external infrastructure and covers most use cases (scripts, single-process web apps, notebooks).
 
----
+**Tradeoff:** The cache is not shared across processes. A multi-worker deployment has independent caches per worker.
 
-### CacheConfig Immutability
+**Immutability:** `CacheConfig` is frozen at construction — `InMemoryCache` and `HTTPClient` share the same config instance, so any post-construction mutation would silently diverge their behaviour. See `cache.py` for full rationale.
 
-**Decision:** `CacheConfig` is a `frozen=True` dataclass. `resource_ttl` is stored as `MappingProxyType` rather than `dict`.
+**Jitter:** Each cache entry gets a small random TTL extension so a burst of simultaneous writes does not all expire at the same moment and flood the API with requests. See `cache.py` for full rationale.
 
-**Reasoning:** Both `InMemoryCache` and `HTTPClient` hold a reference to the same `CacheConfig` instance. `InMemoryCache` uses `config.ttl`, `config.jitter`, and `config.maxsize` when writing entries; `HTTPClient._effective_ttl()` uses `config.resource_ttl` and `config.ttl` when choosing the TTL to pass to `cache.set()`. If the config were mutable, a caller who changes `config.ttl = 30` after client construction would cause the two owners to read different effective values at different times depending on race conditions — the window between an `InMemoryCache.set()` and an `HTTPClient._effective_ttl()` call is small but non-zero. `frozen=True` turns any mutation attempt into an immediate `FrozenInstanceError` at the offending line rather than a silent divergence that would manifest as intermittent TTL mismatches.
+**Thread safety and dog-pile prevention:** A global `RLock` protects the cache store; a per-key lock ensures that when multiple threads miss the same key, only the first thread fetches from the API while the others wait and read the result that was written. See `cache.py` for full rationale.
 
-`resource_ttl` requires special handling because Python's `frozen=True` prevents attribute reassignment but does not prevent mutation of a mutable object (e.g. `config.resource_ttl["movie"] = 999` would still succeed on a plain `dict`). `MappingProxyType` closes this gap: it is a read-only view over the underlying dict. A `__post_init__` method coerces any plain `dict` passed by callers to `MappingProxyType` via `object.__setattr__` (the only way to set attributes inside a frozen dataclass's initialisation path).
-
-**Tradeoff:** Callers who expected to build a `CacheConfig` and modify it incrementally before passing it to the client must construct it in one step. In practice, config objects are always constructed in a single expression; no known caller pattern requires incremental mutation.
+**External backends:** `diskcache`, Memcached, and Redis each require external infrastructure or filesystem side-effects; the `CacheProtocol` interface lets callers plug in those backends later without changing the SDK's resource API. See `cache.py` for full rationale.
 
 ---
 
-### CacheProtocol — Extension Interface
+## 12. Testing Strategy
 
-**Decision:** `HTTPClient` accepts a `CacheProtocol`, not a concrete cache class.
+The test suite has two layers.
 
-```python
-class CacheProtocol(Protocol):
-    def get(self, key: str) -> Any | None: ...
-    def set(self, key: str, value: Any, ttl: int) -> None: ...
-    def delete(self, key: str) -> None: ...
-    def clear(self) -> None: ...
-```
+**Unit tests** use mocked HTTP responses and require no API key or network access. Every response is loaded from `tests/fixtures/` JSON files captured from the real API.
 
-**Reasoning:** `typing.Protocol` is structural — any class with the four methods satisfies it without inheriting from `lotr_sdk`. Callers writing a `RedisCache` do not need to import anything from the SDK. The `ttl` parameter on `set` enables per-resource TTL to be passed at call time without protocol changes in v2.
+Coverage includes:
+- Every resource method
+- HTTP status to exception mapping
+- Authentication resolution order
+- Filter serialisation
+- Model parsing from fixture JSON
+- Cache hit/miss behaviour
+- `force_refresh` behaviour
 
-**Tradeoff:** No compile-time verification that external implementations are correct.
+**Integration tests** call the live API and require `LOTR_API_KEY` and the `--integration` pytest flag. They are separated from unit tests so CI and local development remain deterministic by default.
 
----
+**Decision:** `pytest` + `responses` library for unit tests (zero real network calls); integration tests gated behind `--integration` and `LOTR_API_KEY`.
 
-### Jitter and Thundering Herd
+**Reasoning:** The separation ensures CI never makes real API calls. Unit tests cover all code paths; integration tests verify that the live API shape matches the SDK's models.
 
-**Decision:** `actual_ttl = base_ttl + random.uniform(0, base_ttl * jitter)`.
+**Tradeoff:** Integration tests require a valid API key and a reachable live API.
 
-**Reasoning:** Entries written in the same burst would all expire simultaneously without jitter, causing a wave of simultaneous cache misses. Positive-only jitter ensures no entry expires before `base_ttl`.
+**Why real fixture JSON:** Fixture files are captured from the real API. Hand-crafted JSON risks modelling a shape that does not exist in production, causing unit tests to pass while integration tests fail.
 
-**Tradeoff:** Average TTL is `base_ttl * (1 + jitter/2)` — slightly longer than configured. Acceptable.
-
----
-
-### Thread Safety and Dog-Pile Prevention
-
-**Decision:** Global `RLock` for all cache reads/writes + per-key `Lock` for dog-pile prevention. The global lock is never held during network I/O.
-
-**Reasoning:** Module-level `LotRClient` instances are the common production pattern (Django/Flask apps init at startup and share across request threads). Without locking, concurrent `OrderedDict` reads/writes produce silent data corruption.
-
-**Locking order (deadlock prevention):** Global `RLock` first → per-key `Lock` second. Never reversed.
-
-**Dog-pile sequence:**
-1. Thread A misses → acquires per-key lock
-2. Thread B misses → blocks on the same per-key lock
-3. Thread A fetches → writes cache → releases per-key lock
-4. Thread B acquires → re-checks cache → hits → returns without an API call
-
-**Known gap:**
-
-| Gap | Future fix |
-|-----|-----------|
-| Global `RLock` serialises concurrent reads | Reader-writer lock — concurrent reads in parallel, exclusive writes |
+**Known untested path:** The concurrent dog-pile scenario requires `threading.Event` barriers to test reliably. The implementation is correct by inspection; it is not covered by automated tests in v1.
 
 ---
 
-### Why Not External Backends in v1
+## 13. Maintainability and Security
 
-| Option | Reason rejected |
-|--------|-----------------|
-| `diskcache` (SQLite) | SDK writes to caller's filesystem; schema changes corrupt cached bytes; disk I/O overhead for small payloads |
-| Memcached | Requires running infrastructure; distributed dog-pile needs CAS operations, not `threading.Lock` |
-| Redis | Same infrastructure dependency; `SET NX EX` solves distributed locking but belongs in a caller-provided `CacheProtocol` implementation |
+**No hardcoded secrets:** The API key is resolved from the constructor arg or env var. It never appears in source files. `.env` is gitignored; `.env.example` is committed with a placeholder.
 
-No major public SDK (Stripe, boto3, Twilio, Algolia) ships an external cache backend. The consistent pattern: in-memory for the SDK's own concerns, pluggable interface for callers who need more. `CacheProtocol` is that interface.
-
----
-
-## 10. Testing Strategy
-
-**Decision:** `pytest` + `responses` library for unit tests (zero real network calls); integration tests gated behind `--integration` pytest flag and `LOTR_API_KEY` env var.
-
-**Reasoning:** The separation ensures CI never makes real API calls. Unit tests cover all code paths; integration tests verify the live API shape matches the SDK's models.
-
-**Tradeoff:** Integration tests require a valid API key and the live API to be reachable.
-
-**Coverage required:**
-- Every resource method and every exception type
-- `FilterOptions.to_query_params()`: sorted output, `None` exclusion, type coercion
-- Auth resolution order: constructor arg vs. env var
-- Cache hit/miss paths, TTL expiry via injected `time_fn`, jitter via injected `jitter_fn` [v2]
-
-**Why real fixture JSON:** Fixture files are captured real API responses. Hand-crafted JSON risks modelling a shape that diverges from the actual API, causing unit tests to pass while integration fails.
-
-**Known untested path:** The concurrent dog-pile scenario requires `threading.Event` barriers to test reliably. Implementation is correct by inspection; not covered by automated tests in v1.
-
----
-
-## 11. Maintainability and Security
-
-**No hardcoded secrets:** API key resolved from constructor arg or env var. Never present in source files. `.env` is gitignored; `.env.example` is committed with a placeholder.
-
-**Dependency minimalism:**
+**Minimal dependencies:**
 - Runtime: `requests`, `pydantic` (v2), `python-dotenv` (optional, caller's choice)
 - Test: `pytest`, `responses`, `pytest-cov`
 - No other dependencies without explicit approval
 
-Adding `httpx` for async doubles the client interface with no v1 benefit; deferred to v2.
-
 **Type hygiene:** Every public function signature carries type hints. Pydantic validates at API response boundaries; internal types are trusted. No bare `except` clauses.
 
-**No injection surface:** Pure HTTP client. No subprocess calls, no shell execution, no filesystem writes except through the caller-controlled environment.
+**No injection surface:** The SDK is a pure HTTP client. It makes no subprocess calls, executes no shell commands, and writes nothing to the filesystem.
 
 ---
 
-## 12. Roadmap and Extensibility
-
-### Shipped
-
-| Feature | Where |
-|---------|-------|
-| In-memory TTL + LRU cache with jitter and dog-pile prevention | `lotr_sdk/cache.py` — `InMemoryCache`, `CacheConfig`, `CacheProtocol` |
-| Per-resource TTL override | `CacheConfig.resource_ttl` — looked up in `HTTPClient._effective_ttl()` |
-| Per-key lock GC via `WeakValueDictionary` | `HTTPClient._key_locks` — locks freed when no thread holds a reference |
-| Retry with exponential backoff, ±50% jitter, `max_wait` ceiling | `lotr_sdk/http.py` — `RetryConfig`, `HTTPClient._execute_with_retry()` |
-| 429 `extend_all_ttl` on rate-limit hit | `InMemoryCache.extend_all_ttl()`, called duck-typed from `HTTPClient._request()` |
-
-### Still ahead
+## 14. Roadmap and Extensibility
 
 | Feature | Extension point | Notes |
 |---------|-----------------|-------|
-| External cache backends (Redis, Memcached) | `CacheProtocol` | Redis: `SET NX EX` for atomic distributed lock; Memcached: CAS operations |
+| External cache backends (Redis, Memcached) | `CacheProtocol` | Redis: `SET NX EX` for atomic distributed lock; Memcached: CAS operations. See [`cache.py`](lotr_sdk/cache.py) for the interface definition and adding external backends. |
 | Async client | Separate `AsyncLotRClient` class | `httpx.AsyncClient`; sync `LotRClient` remains the default |
 | Additional endpoints | Additive resource classes | `/book`, `/chapter`, `/character` follow the same namespaced resource pattern |
-| Concurrent read performance | `InMemoryCache` internals | Upgrade global `RLock` to reader-writer lock — concurrent reads proceed in parallel; currently serialised |
+| Concurrent read performance | `InMemoryCache` internals | Upgrade global `RLock` to a reader-writer lock — concurrent reads proceed in parallel; currently serialised |
+
+
