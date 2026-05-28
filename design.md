@@ -220,6 +220,20 @@ All list methods accept an optional `FilterOptions` for pagination, sorting, and
 
 The One API returns **HTTP 500 Internal Server Error** when any `?sort=field:order` query parameter is included in a request. This was verified against the live API during development. As a result, `FilterOptions` does not expose `sort_by` or `sort_order` fields, and no sort parameter is ever sent. If the upstream API resolves this, sorting can be added as a non-breaking addition in a future version.
 
+### Known Limitation — `/movie/{id}/quote` only works for the LotR trilogy
+
+The One API only stores quote data for the three core Lord of the Rings trilogy films. Calling `GET /movie/{id}/quote` with any other movie ID (e.g. The Hobbit films) returns a valid `200 OK` with an empty `docs` array — it does not raise a 404. The SDK surfaces this faithfully: `client.movies.quotes(movie_id)` returns a `ListResponse[Quote]` with `docs = []` for non-trilogy IDs.
+
+The three movie IDs that have quote data:
+
+| Movie | ID |
+|---|---|
+| The Fellowship of the Ring | `5cd95395de30eff6ebccde5c` |
+| The Two Towers | `5cd95395de30eff6ebccde5b` |
+| The Return of the King | `5cd95395de30eff6ebccde5d` |
+
+**SDK behaviour:** No special-casing is applied. The SDK passes the request through and returns whatever the API responds with. Callers who need to guard against empty results can check `response.total == 0` or `len(response.docs) == 0`.
+
 ---
 
 ### Field Filtering

@@ -89,12 +89,30 @@ class MoviesResource:
     ) -> ListResponse[Quote]:
         """Return quotes for a given movie, with optional filtering.
 
+        **API limitation:** The One API only stores quotes for the three core
+        Lord of the Rings trilogy films. Calling this method with any other
+        movie ID (e.g. The Hobbit films) returns an empty ``docs`` list rather
+        than a 404 — the API accepts the request but has no quote data for it.
+
+        Trilogy movie IDs with quote data:
+
+        +-----------------------------------------+------------------------------+
+        | Movie                                   | ID                           |
+        +=========================================+==============================+
+        | The Fellowship of the Ring              | 5cd95395de30eff6ebccde5c     |
+        +-----------------------------------------+------------------------------+
+        | The Two Towers                          | 5cd95395de30eff6ebccde5b     |
+        +-----------------------------------------+------------------------------+
+        | The Return of the King                  | 5cd95395de30eff6ebccde5d     |
+        +-----------------------------------------+------------------------------+
+
         Args:
             movie_id: The One API document ID of the movie.
             filters:  Optional FilterOptions for pagination / sort / field filter.
 
         Returns:
-            ListResponse[Quote] — paginated quote envelope.
+            ListResponse[Quote] — paginated quote envelope. ``docs`` will be
+            empty for non-trilogy movies.
 
         Raises:
             NotFoundError:    movie_id does not exist.
