@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "rudra-lotr-sdk"
+name = "rudra-sdk"
 version = "0.1.0"
 description = "Python SDK for The One API (Lord of the Rings)"
 readme = "README.md"
@@ -27,8 +27,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/rudrasen/rudra-lotr-sdk"
-Issues = "https://github.com/rudrasen/rudra-lotr-sdk/issues"
+Repository = "https://github.com/rudrasen/rudra-sdk"
+Issues = "https://github.com/rudrasen/rudra-sdk/issues"
 
 [project.optional-dependencies]
 # python-dotenv is optional — callers who load .env themselves do not need it.

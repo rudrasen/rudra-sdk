@@ -271,7 +271,7 @@ Expected output:
 ## Project structure
 
 ```
-rudra-lotr-sdk/
+rudra-sdk/
 ├── lotr_sdk/
 │   ├── client.py          # LotRClient — thin entry point
 │   ├── exceptions.py      # SDK exception hierarchy

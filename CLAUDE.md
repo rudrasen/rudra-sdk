@@ -227,13 +227,13 @@ The assignment is not done until all of these exist and work:
 - [x] `tests/fixtures/` with real API response JSON
 - [x] `tests/unit/` — all passing with no network, no API key
 - [x] `tests/integration/` — gated behind `--integration` flag
-- [ ] `demo.py` — runnable, readable output, instructions in README
+- [x] `demo.py` — runnable, readable output, instructions in README
 - [x] `design.md` — architecture, decisions, rationale, v2 roadmap
-- [ ] `README.md` — installation, API key setup, quickstart, filter examples, how to run unit tests, integration tests, demo
+- [x] `README.md` — installation, API key setup, quickstart, filter examples, how to run unit tests, integration tests, demo
 - [x] `pyproject.toml` — correct metadata, dependencies, test config
-- [ ] `.env.example` — committed, with placeholder value
+- [x] `.env.example` — committed, with placeholder value
 - [x] `.gitignore` — `.env` excluded, `__pycache__` excluded
-- [ ] Repo name: "{your name} SDK" (assignment requirement — do not forget)
+- [x] Repo name: "Rudra SDK" — GitHub repo renamed to rudra-sdk
 
 ---
 
