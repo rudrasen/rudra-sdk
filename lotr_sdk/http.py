@@ -4,16 +4,30 @@ HTTPClient — single authenticated session for The One API.
 All HTTP status → SDK exception mapping lives in this module exclusively.
 All pydantic.ValidationError → lotr_sdk.ValidationError mapping lives in
 parse_response() exclusively.
+
+Request flow (when cache and retry are configured):
+
+    _request()               cache-aware outer wrapper
+        ↓ cache miss
+    _execute_with_retry()    retry loop (exponential backoff for 5xx,
+                             Retry-After header for 429)
+        ↓ each attempt
+    _raw_request()           bare HTTP — one request, no cache, no retry
 """
 
 from __future__ import annotations
 
+import threading
+import time
+import weakref
+from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 import pydantic
 import requests
 import requests.exceptions
 
+from lotr_sdk.cache import CacheConfig, CacheProtocol
 from lotr_sdk.exceptions import (
     APIError,
     AuthError,
@@ -22,7 +36,7 @@ from lotr_sdk.exceptions import (
     ValidationError,
 )
 
-__all__ = ["HTTPClient", "parse_response"]
+__all__ = ["HTTPClient", "RetryConfig", "parse_response"]
 
 _T = TypeVar("_T")
 
@@ -34,29 +48,208 @@ _HTTP_SERVER_ERROR_MIN = 500
 _HTTP_SERVER_ERROR_MAX = 599
 
 
+@dataclass
+class RetryConfig:
+    """Configuration for automatic request retry with exponential backoff.
+
+    Retry behaviour:
+    - 429 (RateLimitError): waits for ``retry_after`` seconds from the
+      ``Retry-After`` response header (falls back to backoff formula when
+      header is absent or zero). The server signals the exact window reset time.
+    - 5xx / 502 / 503 (APIError): exponential backoff —
+      ``sleep = backoff_factor * 2 ** (attempt - 1)`` seconds.
+    - 401 / 404: never retried regardless of ``retry_on`` — retrying the same
+      credential or ID produces the same error on every attempt.
+
+    Args:
+        max_attempts:   Total attempts including the first (not extra retries).
+                        ``3`` means one initial call plus up to two retries.
+        backoff_factor: Multiplier for the exponential sleep on 5xx.
+                        Attempt 1 failure → sleep ``backoff_factor * 1`` s.
+                        Attempt 2 failure → sleep ``backoff_factor * 2`` s.
+        retry_on:       HTTP status codes that trigger a retry. 401 and 404
+                        are ignored even if listed here.
+    """
+
+    max_attempts: int = 3
+    backoff_factor: float = 1.0
+    retry_on: list[int] = field(default_factory=lambda: [429, 500, 502, 503])
+
+
+def _make_cache_key(endpoint: str, params: dict[str, Any] | None) -> str:
+    """Build a deterministic cache key for a GET request.
+
+    ``sorted()`` on the params dict guarantees the same key regardless of
+    insertion order — necessary because ``FilterOptions.to_query_params()``
+    returns a plain dict whose ordering is an implementation detail.
+    """
+    if params:
+        pairs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        return f"GET:{endpoint}?{pairs}"
+    return f"GET:{endpoint}"
+
+
 class HTTPClient:
     """Single-session authenticated HTTP client for The One API.
 
     Wraps ``requests.Session`` with Bearer-token auth, timeout enforcement,
-    and HTTP status → SDK exception mapping.
+    HTTP status → SDK exception mapping, optional LRU/TTL caching, and
+    optional retry-with-backoff.
 
-    Thread safety: the ``Authorization`` header is set once at construction
-    and never modified thereafter. Concurrent reads across threads are safe
-    under this constraint — no per-request mutation of session state occurs.
+    Thread safety:
+    - The ``Authorization`` header is set once at construction and never
+      modified. Concurrent reads across threads are safe under this constraint.
+    - Per-key ``threading.Lock`` objects (held in a ``WeakValueDictionary``)
+      prevent the dog-pile problem: only one thread fetches a given cache key
+      at a time; waiting threads re-check the cache after the lock is released.
+    - ``_lock`` (the global RLock on InMemoryCache) is never held during
+      network I/O so it cannot block unrelated cache operations.
 
-    Network-level failures (DNS, connection refused, read timeout) are caught
-    and re-raised as ``APIError(status_code=0)`` so callers only need to catch
-    ``LotRError``, not ``requests`` internals.
+    Args:
+        api_key:      Bearer token injected into every request.
+        base_url:     API root, e.g. ``"https://the-one-api.dev/v2"``.
+        timeout:      Per-request socket timeout in seconds (connection + read).
+        cache:        Optional cache implementing ``CacheProtocol``. When
+                      ``None``, caching is disabled.
+        cache_config: TTL / jitter / per-resource TTL settings. Required to
+                      derive the TTL passed to ``cache.set()``.
+        retry_config: Retry policy. When ``None``, a single attempt is made and
+                      any error is raised immediately.
     """
 
-    def __init__(self, api_key: str, base_url: str, timeout: int = 10) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        timeout: int = 10,
+        cache: CacheProtocol | None = None,
+        cache_config: CacheConfig | None = None,
+        retry_config: RetryConfig | None = None,
+    ) -> None:
         self._base_url = base_url
         self._timeout = timeout
         self._session = requests.Session()
-        # Set once on the session so every subsequent request carries it.
         self._session.headers.update({"Authorization": f"Bearer {api_key}"})
+        self._cache = cache
+        self._cache_config = cache_config
+        self._retry_config = retry_config
+        # Per-key locks for dog-pile prevention. WeakValueDictionary ensures
+        # locks are GC'd when no thread holds a live reference, preventing
+        # unbounded accumulation across large key spaces.
+        self._key_locks: weakref.WeakValueDictionary[
+            str, threading.Lock
+        ] = weakref.WeakValueDictionary()
+        self._key_locks_meta = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
 
     def _request(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute an authenticated request; return the JSON body as a dict.
+
+        Cache layer (GET only):
+        1. Fast path — ``cache.get(key)`` returns on hit.
+        2. Slow path — acquire per-key lock, double-check, call
+           ``_execute_with_retry()``, store result.
+
+        On ``RateLimitError`` in the slow path, ``extend_all_ttl`` is called
+        (duck-typed) so cached entries survive the rate-limit window without
+        expiring mid-retry.
+
+        Non-GET methods and requests with no cache bypass the cache layer
+        entirely and go straight to ``_execute_with_retry()``.
+        """
+        if self._cache is None or method.upper() != "GET":
+            return self._execute_with_retry(method, endpoint, params)
+
+        key = _make_cache_key(endpoint, params)
+
+        # Fast path.
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+
+        # Slow path — dog-pile lock.
+        key_lock = self._get_key_lock(key)
+        with key_lock:
+            # Double-check: another thread may have populated the cache
+            # while we were waiting for the key lock.
+            cached = self._cache.get(key)
+            if cached is not None:
+                return cached  # type: ignore[return-value]
+
+            try:
+                result = self._execute_with_retry(method, endpoint, params)
+            except RateLimitError as exc:
+                # Extend cached entries so they survive the rate-limit window.
+                if hasattr(self._cache, "extend_all_ttl"):
+                    self._cache.extend_all_ttl(  # type: ignore[union-attr]
+                        exc.retry_after if exc.retry_after > 0 else 60
+                    )
+                raise
+
+            self._cache.set(key, result, ttl=self._effective_ttl(endpoint))
+            return result
+
+    # ------------------------------------------------------------------
+    # Retry layer
+    # ------------------------------------------------------------------
+
+    def _execute_with_retry(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Wrap ``_raw_request`` in the configured retry loop.
+
+        429 uses ``Retry-After`` from the header (the server signals the exact
+        reset time). 5xx uses exponential backoff. 401/404 are never retried.
+        When ``retry_config`` is ``None``, a single attempt is made.
+        """
+        if self._retry_config is None:
+            return self._raw_request(method, endpoint, params)
+
+        cfg = self._retry_config
+        last_exc: Exception | None = None
+
+        for attempt in range(1, cfg.max_attempts + 1):
+            try:
+                return self._raw_request(method, endpoint, params)
+            except RateLimitError as exc:
+                if _HTTP_TOO_MANY_REQUESTS not in cfg.retry_on:
+                    raise
+                if attempt == cfg.max_attempts:
+                    raise
+                wait = (
+                    float(exc.retry_after)
+                    if exc.retry_after > 0
+                    else self._backoff(attempt, cfg.backoff_factor)
+                )
+                time.sleep(wait)
+                last_exc = exc
+            except APIError as exc:
+                if exc.status_code not in cfg.retry_on:
+                    raise
+                if attempt == cfg.max_attempts:
+                    raise
+                time.sleep(self._backoff(attempt, cfg.backoff_factor))
+                last_exc = exc
+
+        # Unreachable: the last iteration always raises.  Satisfies type checker.
+        raise last_exc  # type: ignore[misc]
+
+    # ------------------------------------------------------------------
+    # Raw HTTP layer (original _request body, unchanged)
+    # ------------------------------------------------------------------
+
+    def _raw_request(
         self,
         method: str,
         endpoint: str,
@@ -85,7 +278,6 @@ class HTTPClient:
             )
         except requests.exceptions.RequestException as exc:
             # Never reached the server — no status code available.
-            # status_code=0 is the sentinel for network-level failure.
             raise APIError(
                 f"Network error contacting {url!r}: {exc}", status_code=0
             ) from exc
@@ -95,11 +287,14 @@ class HTTPClient:
         try:
             return response.json()  # type: ignore[no-any-return]
         except ValueError as exc:
-            # 2xx but non-JSON body — treat as a server-side error.
             raise APIError(
                 f"Response from {url!r} is not valid JSON: {exc}",
                 status_code=response.status_code,
             ) from exc
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _raise_for_status(
         self, response: requests.Response, endpoint: str
@@ -108,10 +303,6 @@ class HTTPClient:
 
         The only place in the SDK where HTTP status codes are inspected.
         2xx responses return without raising; everything else raises.
-
-        Retry-After is parsed as an integer seconds value. Non-integer values
-        (HTTP-date format) fall back to 0; callers should treat retry_after=0
-        as "wait an unspecified duration".
         """
         status = response.status_code
 
@@ -125,11 +316,6 @@ class HTTPClient:
             )
 
         if status == _HTTP_NOT_FOUND:
-            # Extract the resource ID from the endpoint path.
-            # /movie/{id}          → parts = ["movie", "{id}"]       → parts[1]
-            # /movie/{id}/quote    → parts = ["movie", "{id}", "quote"] → parts[1]
-            # /quote/{id}          → parts = ["quote", "{id}"]       → parts[1]
-            # /movie (bare list)   → parts = ["movie"]               → parts[0] (fallback)
             parts = endpoint.strip("/").split("/")
             resource_id = parts[1] if len(parts) > 1 else parts[0]
             raise NotFoundError(
@@ -155,12 +341,43 @@ class HTTPClient:
                 status_code=status,
             )
 
-        # Unexpected 4xx — 400, 403, 405, etc. Not mapped to a specific subclass
-        # because The One API does not document these for in-scope endpoints.
         raise APIError(
             f"Unexpected client error (HTTP {status}): {endpoint!r}",
             status_code=status,
         )
+
+    def _get_key_lock(self, key: str) -> threading.Lock:
+        """Return (or create) the per-key lock for dog-pile prevention.
+
+        The WeakValueDictionary releases the Lock once no thread holds a
+        local reference, preventing unbounded lock accumulation.
+        Callers MUST assign the result to a local variable before entering
+        the ``with`` block so the GC cannot collect it mid-operation.
+        """
+        with self._key_locks_meta:
+            lock = self._key_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._key_locks[key] = lock
+            return lock
+
+    def _effective_ttl(self, endpoint: str) -> int:
+        """Resolve the TTL for a given endpoint.
+
+        Strips the leading slash and takes the first path segment as the
+        resource name (``/movie/123/quote`` → ``"movie"``). Looks it up in
+        ``cache_config.resource_ttl``; falls back to ``cache_config.ttl``.
+        Returns 300 when no cache config is present.
+        """
+        if self._cache_config is None:
+            return 300
+        resource = endpoint.strip("/").split("/")[0]
+        return self._cache_config.resource_ttl.get(resource, self._cache_config.ttl)
+
+    @staticmethod
+    def _backoff(attempt: int, factor: float) -> float:
+        """Exponential backoff: ``factor * 2^(attempt-1)`` seconds."""
+        return factor * (2 ** (attempt - 1))
 
     def close(self) -> None:
         """Release the underlying connection pool."""

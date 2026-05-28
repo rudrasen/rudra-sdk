@@ -91,7 +91,7 @@ for movie in movies.docs:
 movie = client.movies.get("5cd95395de30eff6ebccde5c")
 print(movie.name)  # The Fellowship of the Ring
 
-# Quotes for a movie
+# Quotes for a movie (trilogy films only — see note below)
 quotes = client.movies.quotes("5cd95395de30eff6ebccde5c")
 for quote in quotes.docs:
     print(quote.dialog)
@@ -100,6 +100,16 @@ for quote in quotes.docs:
 quote = client.quotes.get("5cd96e05de30eff6ebcce7e9")
 print(quote.dialog)
 ```
+
+> **Note — quotes are only available for the LotR trilogy:**
+> `client.movies.quotes(movie_id)` returns quotes for the three core trilogy films only.
+> Calling it with any other movie ID (e.g. The Hobbit films) returns an **empty list** rather than a 404 — the API accepts the request but holds no quote data for those titles.
+>
+> | Movie | ID |
+> |---|---|
+> | The Fellowship of the Ring | `5cd95395de30eff6ebccde5c` |
+> | The Two Towers | `5cd95395de30eff6ebccde5b` |
+> | The Return of the King | `5cd95395de30eff6ebccde5d` |
 
 ---
 

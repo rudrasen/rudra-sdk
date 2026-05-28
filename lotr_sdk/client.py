@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import os
 
+from lotr_sdk.cache import CacheConfig, InMemoryCache
 from lotr_sdk.exceptions import AuthError
-from lotr_sdk.http import HTTPClient
+from lotr_sdk.http import HTTPClient, RetryConfig
 from lotr_sdk.resources import MoviesResource, QuotesResource
 
 __all__ = ["LotRClient"]
@@ -30,12 +31,19 @@ class LotRClient:
     for reads.
 
     Args:
-        api_key: Bearer token for The One API. When ``None`` (default),
-                 the value of the ``LOTR_API_KEY`` environment variable is used.
-                 Raises ``AuthError`` at construction time if neither source
-                 provides a non-empty value.
-        timeout: Per-request socket timeout in seconds (connection + read).
-                 Defaults to 10.
+        api_key:      Bearer token for The One API. When ``None`` (default),
+                      the value of the ``LOTR_API_KEY`` environment variable is
+                      used. Raises ``AuthError`` at construction time if neither
+                      source provides a non-empty value.
+        timeout:      Per-request socket timeout in seconds (connection + read).
+                      Defaults to 10.
+        cache_config: Optional :class:`~lotr_sdk.cache.CacheConfig`. When
+                      provided, an :class:`~lotr_sdk.cache.InMemoryCache` is
+                      created and attached to the HTTP client. When ``None``
+                      (default), caching is disabled.
+        retry_config: Optional :class:`~lotr_sdk.http.RetryConfig`. When
+                      provided, failed requests are retried according to the
+                      policy. When ``None`` (default), a single attempt is made.
 
     Attributes:
         movies: :class:`~lotr_sdk.resources.MoviesResource` — wraps ``/movie``
@@ -45,11 +53,18 @@ class LotRClient:
 
     Example::
 
-        from lotr_sdk import LotRClient
+        from lotr_sdk import LotRClient, CacheConfig, RetryConfig
 
-        client = LotRClient()                # reads LOTR_API_KEY from env
-        client = LotRClient("mytoken")       # explicit key
-        client = LotRClient(timeout=30)      # slow-network tolerance
+        # Minimal — reads LOTR_API_KEY from env, no cache, no retry
+        client = LotRClient()
+
+        # With cache + retry (recommended for production use)
+        # CacheConfig(ttl=600) matches the 100-queries-per-10-min rate limit:
+        # any call repeated within 10 minutes is served from cache at zero cost.
+        client = LotRClient(
+            cache_config=CacheConfig(ttl=600, jitter=0.1),
+            retry_config=RetryConfig(max_attempts=3, backoff_factor=1.0),
+        )
 
         movies = client.movies.list()
         quote  = client.quotes.get("5cd96e05de30eff6ebcce7e9")
@@ -63,6 +78,8 @@ class LotRClient:
         self,
         api_key: str | None = None,
         timeout: int = 10,
+        cache_config: CacheConfig | None = None,
+        retry_config: RetryConfig | None = None,
     ) -> None:
         # Constructor arg takes precedence; fall back to env var.
         # or/and semantics: api_key="" is falsy and correctly falls through.
@@ -73,10 +90,15 @@ class LotRClient:
                 f"{_ENV_KEY!r} environment variable before constructing the client."
             )
 
+        cache = InMemoryCache(cache_config) if cache_config is not None else None
+
         self._http = HTTPClient(
             api_key=resolved_key,
             base_url=_BASE_URL,
             timeout=timeout,
+            cache=cache,
+            cache_config=cache_config,
+            retry_config=retry_config,
         )
 
         self.movies: MoviesResource = MoviesResource(self._http)
