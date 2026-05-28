@@ -1,17 +1,9 @@
 """
 HTTPClient — single authenticated session for The One API.
 
-All HTTP status → SDK exception mapping lives here and ONLY here.
-All pydantic.ValidationError → lotr_sdk.ValidationError mapping lives here
-and ONLY here (via parse_response).
-
-V2 roadmap — NOT implemented in v1:
-    RetryConfig  — exponential back-off on 429 / 5xx with configurable
-                   max_attempts, backoff_factor, and per-status retry sets.
-                   Will wrap _request() in a retry loop.
-    CacheLayer   — in-memory TTL + jitter cache, optionally backed by
-                   Memcached or Redis. Will short-circuit _request() on hits.
-    Async client — httpx-based variant; separate class, separate module.
+All HTTP status → SDK exception mapping lives in this module exclusively.
+All pydantic.ValidationError → lotr_sdk.ValidationError mapping lives in
+parse_response() exclusively.
 """
 
 from __future__ import annotations
@@ -45,21 +37,16 @@ _HTTP_SERVER_ERROR_MAX = 599
 class HTTPClient:
     """Single-session authenticated HTTP client for The One API.
 
-    Wraps ``requests.Session`` with:
-    - Bearer-token auth header set once on construction (not per-request)
-    - Consistent timeout enforcement on every call
-    - HTTP status → SDK exception mapping on every response
+    Wraps ``requests.Session`` with Bearer-token auth, timeout enforcement,
+    and HTTP status → SDK exception mapping.
 
-    Assumptions:
-        base_url has no trailing slash. client.py enforces this by passing
-        the constant "https://the-one-api.dev/v2".
-        timeout applies to both connection and read phases (requests default).
-        Network-level failures (DNS, refused connection, read timeout) are
-        wrapped as APIError(status_code=0) so callers only need to catch
-        LotRError, not requests internals.
+    Thread safety: the ``Authorization`` header is set once at construction
+    and never modified thereafter. Concurrent reads across threads are safe
+    under this constraint — no per-request mutation of session state occurs.
 
-    V2 roadmap (see module docstring):
-        RetryConfig and CacheLayer will be wired in here, not in resources.
+    Network-level failures (DNS, connection refused, read timeout) are caught
+    and re-raised as ``APIError(status_code=0)`` so callers only need to catch
+    ``LotRError``, not ``requests`` internals.
     """
 
     def __init__(self, api_key: str, base_url: str, timeout: int = 10) -> None:
@@ -77,20 +64,9 @@ class HTTPClient:
     ) -> dict[str, Any]:
         """Execute one authenticated HTTP request; return the JSON body as a dict.
 
-        Non-2xx responses never return — they always raise an SDK exception.
-        JSON-decode failure on a 2xx is raised as APIError (server sent bad data).
-        Pydantic validation is NOT done here; call parse_response() after.
-
-        Args:
-            method:   HTTP verb, e.g. ``"GET"``.
-            endpoint: Path starting with ``"/"``, e.g. ``"/movie"`` or
-                      ``"/movie/5cd95395de30eff6ebccde5d/quote"``.
-                      Must not include the base URL.
-            params:   Query parameters dict, already serialised (e.g. via
-                      FilterOptions.to_query_params()).
-
-        Returns:
-            Parsed JSON response body.
+        Non-2xx responses always raise an SDK exception. JSON-decode failure
+        on a 2xx is raised as APIError. Pydantic validation is NOT done here;
+        call parse_response() after.
 
         Raises:
             AuthError:       HTTP 401
@@ -130,18 +106,12 @@ class HTTPClient:
     ) -> None:
         """Map HTTP error status codes to SDK exceptions.
 
-        THIS IS THE ONLY PLACE IN THE SDK WHERE HTTP STATUS CODES ARE MAPPED.
-        Do not add status-code branches in resources, client, or tests.
+        The only place in the SDK where HTTP status codes are inspected.
+        2xx responses return without raising; everything else raises.
 
-        2xx responses return without raising. Everything else raises.
-
-        Assumption: The One API never returns 201/204 for success — it always
-        returns 200. The 2xx range is accepted defensively.
-
-        Assumption: Retry-After header is always a whole-second integer string.
-        Non-integer values (HTTP-date format) are treated as 0 so RateLimitError
-        is always constructable. Callers should treat retry_after=0 as
-        "wait an unspecified duration", per the exceptions.py docstring.
+        Retry-After is parsed as an integer seconds value. Non-integer values
+        (HTTP-date format) fall back to 0; callers should treat retry_after=0
+        as "wait an unspecified duration".
         """
         status = response.status_code
 
@@ -206,26 +176,12 @@ class HTTPClient:
 def parse_response(model_cls: type[_T], data: dict[str, Any]) -> _T:
     """Validate a raw API dict against a Pydantic model; return the model instance.
 
-    This is the ONLY place in the SDK where ``pydantic.ValidationError`` is
-    caught and re-raised as ``lotr_sdk.ValidationError``.
-
-    Resources MUST call this instead of calling ``model_cls.model_validate()``
-    directly so that all error-mapping stays auditable in http.py.
-
-    Args:
-        model_cls: A Pydantic model class or generic alias, e.g.
-                   ``ListResponse[Movie]`` or ``Quote``.
-                   Typing note: ``type[_T]`` does not precisely express generic
-                   aliases (``ListResponse[Movie]``); mypy will infer ``Any``
-                   for the return type in those cases. This is a known Python
-                   typing limitation and is correct at runtime.
-        data:      Raw dict from ``HTTPClient._request()``.
-
-    Returns:
-        A validated, frozen model instance.
+    The only place in the SDK where ``pydantic.ValidationError`` is caught
+    and re-raised as ``lotr_sdk.ValidationError``. Resources must call this
+    instead of ``model_cls.model_validate()`` directly.
 
     Raises:
-        lotr_sdk.ValidationError: the response shape did not match the model.
+        lotr_sdk.ValidationError: response shape did not match the model.
             ``exc.__cause__`` holds the original ``pydantic.ValidationError``
             for field-level diagnostics.
     """

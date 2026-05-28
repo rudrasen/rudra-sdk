@@ -4,6 +4,35 @@
 The signal examiners are reading for in design.md is: does this person understand the tradeoffs they made, or did they just let a tool generate an SDK and documentation they can't defend?
 -->
 
+
+update design.md to focus on the SDK design. Make it concrete and reviewer-friendly
+
+
+A. organize into below sections:
+## 1. Goals and Scope
+## 2. Architecture Diagram
+## 3. Public API
+## 4. Resource and Model Abstractions
+## 5. HTTP Layer
+## 6. Authentication
+## 7. Filtering and Pagination
+## 8. Error Handling
+## 9. Retry, Timeout, and Rate Limit Strategy
+## 10. Caching Strategy
+## 11. Testing Strategy
+## 12. maintainability and  Security and Secrets
+## 13. v2 roadmap and extensibility
+
+in each section include 
+Decision:
+Reasoning: if applicable add alternative considered
+Tradeoff:
+
+B. add the new  field filtering to  7. Filtering and Pagination   section  . 
+C. relocate the essential code implementation choices, low level design choices into the respective source class as doc strings
+D. Simplfy doc strings to remove implmentation details where the code behaviour is self-evident. remove redundant information such as Method Signatures,Response models, Field naming, data structure details.  
+
+
 Create a structured design.md with information about my SDK design based on my directives and include the reasoning and tradeoffs. catch any gaps or assumption in my directives, reason or tradeoffs then ask clarify to extract the reasoning and tradeoff    
 - Architecture Use Namespaced Resources design pattern because it allows for 
 
