@@ -15,17 +15,28 @@ Covers `/movie`, `/movie/{id}`, `/movie/{id}/quote`, `/quote`, and `/quote/{id}`
 
 ## Installation
 
-```bash
-# Clone the repo
-git clone <repo-url>
-cd rudra-lotr-sdk
+### Using the SDK (recommended)
 
-# Create and activate a virtual environment
+```bash
+# Install directly from GitHub
+pip install git+https://github.com/rudrasen/rudra-sdk.git
+
+# Or clone and install locally
+git clone https://github.com/rudrasen/rudra-sdk.git
+cd rudra-sdk
+pip install .
+```
+
+### Contributing / running the tests
+
+```bash
+git clone https://github.com/rudrasen/rudra-sdk.git
+cd rudra-sdk
+
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-# Install the SDK with dev dependencies
-pip install -e ".[dev]"
+pip install -e ".[dev]"          # installs SDK + test dependencies
 ```
 
 ---
