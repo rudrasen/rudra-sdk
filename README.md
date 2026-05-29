@@ -1,8 +1,14 @@
 # Rudra SDK
 
-A Python client for [The One API](https://the-one-api.dev) — Lord of the Rings movie and quote data.
+A Python client for [The One API](https://the-one-api.dev) — Lord of the Rings movie and quote data.The SDK wraps five read-only endpoints with a typed, Pythonic interface.
 
-The SDK wraps five read-only endpoints with a typed, Pythonic interface. It handles authentication, pagination, field filtering, error classification, optional in-memory caching, and retry logic, so your code stays focused on what it does rather than how it talks to the API. For architecture decisions, design tradeoffs, and extensibility notes, see [design.md](design.md).
+    GET /movie
+    GET /movie/{id}
+    GET /movie/{id}/quote
+    GET /quote
+    GET /quote/{id}
+
+ It handles authentication, pagination, field filtering, error classification, optional in-memory caching, and retry logic, so your code stays focused on what it does rather than how it talks to the API. For architecture decisions, design tradeoffs, and extensibility notes, see [design.md](design.md).
 
 ---
 
