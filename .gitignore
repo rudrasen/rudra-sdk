@@ -19,9 +19,8 @@ build/
 .coverage
 .vscode/
 
-# GSD planning (local tooling, not part of SDK submission)
+# local tooling, not part of SDK submission)
 .planning/
 .claude/
+CLAUDE.md
 
-# docs source not for public repo
-docs 
