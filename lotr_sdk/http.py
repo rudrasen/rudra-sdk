@@ -384,11 +384,6 @@ class HTTPClient:
         return self._cache_config.resource_ttl.get(resource, self._cache_config.ttl)
 
     @staticmethod
-    def _backoff(attempt: int, factor: float) -> float:
-        """Pure exponential: ``factor * 2^(attempt-1)`` seconds (no jitter)."""
-        return factor * (2 ** (attempt - 1))
-
-    @staticmethod
     def _jittered_backoff(attempt: int, factor: float) -> float:
         """Exponential backoff with ±50% jitter.
 

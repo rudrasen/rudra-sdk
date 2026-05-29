@@ -118,8 +118,8 @@ These are decided. Do not suggest alternatives unless implementation makes them 
   | network failure | `APIError(status_code=0)` | No |
 
 - **HTTP:** `requests.Session`. Single `HTTPClient` class. One shared session per `LotRClient`. No async in v1.
-- **Filtering:** `FilterOptions` Pydantic model with `to_query_params()`. Supports: `limit`, `page`, `offset`, `sort_by`, `sort_order`, `filter_field`, `filter_value`, `filter_operator`. LT/GT/GTE/LTE validate numeric `filter_value` at construction time.
-- **Caching:** Designed for v2. `CacheProtocol` interface planned (`get`, `set`, `delete`, `clear`). In-memory TTL+LRU with jitter. Extend to Memcached/Redis via the protocol — not v1.
+- **Filtering:** `FilterOptions` Pydantic model with `to_query_params()`. Supports: `limit`, `page`, `offset`, `filter_field`, `filter_value`, `filter_operator`. LT/GT/GTE/LTE validate numeric `filter_value` at construction time.
+- **Caching:** Implemented in v1 as opt-in. `CacheProtocol` interface (`get`, `set`, `delete`, `clear`). `InMemoryCache`: TTL+LRU eviction, jitter, dog-pile prevention via per-key lock. `CacheConfig` passed to `LotRClient`; omit to disable. Redis/Memcached via protocol extension — v2 only.
 - **Retry:** `RetryConfig` API designed for v2. Not implemented in v1. When absent, one attempt only.
 - No CLI, no async, no additional endpoints beyond the 5 in scope.
 
