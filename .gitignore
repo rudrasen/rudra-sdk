@@ -16,7 +16,7 @@ dist/
 build/
 
 # scratch / editor artefacts
-lotr_sdk/scratch.json
+.coverage
 .vscode/
 
 # docs source not for public repo
