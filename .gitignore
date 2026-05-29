@@ -11,16 +11,40 @@ lib64/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.pyw
+.Python
 *.egg-info/
 dist/
 build/
 
-# scratch / editor artefacts
-.coverage
-.vscode/
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+MANIFEST
 
-# local tooling, not part of SDK submission)
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# IDE and local tooling files
+.vscode/
+.coverage
+.idea/
+*.swp
+*.swo
+*~
 .planning/
 .claude/
 CLAUDE.md
+
+# macOS
+.DS_Store
+
 
