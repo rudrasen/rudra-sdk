@@ -231,3 +231,28 @@ class TestHTTPErrorMapping:
         with pytest.raises(APIError) as exc_info:
             client.movies.list()
         assert exc_info.value.status_code == 0
+
+    @resp.activate
+    def test_2xx_non_json_body_raises_api_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        resp.add(resp.GET, MOVIES_URL, body="<html>maintenance</html>", status=200,
+                 content_type="text/html")
+        client = LotRClient(api_key=DUMMY_KEY)
+        with pytest.raises(APIError):
+            client.movies.list()
+
+
+class TestContextManager:
+    def test_context_manager_closes_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import patch
+
+        monkeypatch.delenv("LOTR_API_KEY", raising=False)
+        client = LotRClient(api_key=DUMMY_KEY)
+        with patch.object(client, "close") as mock_close:
+            with client:
+                pass
+        mock_close.assert_called_once()
