@@ -1,40 +1,84 @@
 # Rudra SDK
 
-A Python client for [The One API](https://the-one-api.dev) — Lord of the Rings movie and quote data.The SDK wraps five read-only endpoints with a typed, Pythonic interface.
-
-    GET /movie
-    GET /movie/{id}
-    GET /movie/{id}/quote
-    GET /quote
-    GET /quote/{id}
-
- It handles authentication, pagination, field filtering, error classification, optional in-memory caching, and retry logic, so your code stays focused on what it does rather than how it talks to the API. For architecture decisions, design tradeoffs, and extensibility notes, see [design.md](design.md).
+A typed Python client for [The One API](https://the-one-api.dev) — Lord of the Rings movie and quote data. It handles authentication, pagination, field filtering, error classification, optional in-memory caching, and retry logic, so your code stays focused on the data rather than the HTTP layer. For architecture decisions, design tradeoffs, and extensibility notes, see [design.md](design.md).
 
 ---
 
 ## Table of Contents
 
-1. [Requirements](#requirements)
+1. [Reviewer Quickstart](#reviewer-quickstart)
 2. [Installation](#installation)
 3. [API Key Setup](#api-key-setup)
 4. [Usage](#usage)
-5. [Running the Demo](#running-the-demo)
-6. [Filtering and Pagination](#filtering-and-pagination)
-7. [Caching and Retry](#caching-and-retry)
-8. [Error Handling](#error-handling)
-9. [Running the Tests](#running-the-tests)
-10. [Project Structure](#project-structure)
+5. [Filtering and Pagination](#filtering-and-pagination)
+6. [Caching and Retry](#caching-and-retry)
+7. [Error Handling](#error-handling)
+8. [Running the Tests](#running-the-tests)
+9. [Project Structure](#project-structure)
+10. [Known Limitations](#known-limitations)
 
 ---
 
-## Requirements
+## Reviewer Quickstart
 
-- Python 3.11 or later
-- A free API token from [the-one-api.dev/sign-up](https://the-one-api.dev/sign-up)
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+pytest
+
+export LOTR_API_KEY="your-token"
+python demo.py
+```
+
+The demo exercises all five endpoints and prints formatted output to the terminal. Expected output:
+
+```
+==============================================================
+  All Movies
+==============================================================
+  Total: 8 titles
+
+  The Lord of the Rings Series                   558 min
+  ...
+
+==============================================================
+  Single Movie — The Fellowship of the Ring
+==============================================================
+  Name:               The Fellowship of the Ring
+  Runtime:            178 min
+  Budget:             $93.0M
+  Box office:         $871.5M
+  Academy Award wins: 4
+  Rotten Tomatoes:    91.0%
+
+==============================================================
+  Movie Quotes — The Fellowship of the Ring (limit=5)
+==============================================================
+  Showing 5 of 503 total quotes
+
+  1. "Who is she? This woman you sing of?"
+  ...
+
+==============================================================
+  All Quotes — sample (limit=5)
+==============================================================
+  Showing 5 of 2383 total quotes across all movies
+  ...
+
+==============================================================
+  Single Quote
+==============================================================
+  "Deagol!!"
+  — character ID: 5cd99d4bde30eff6ebccfe9e
+  — movie ID:     5cd95395de30eff6ebccde5d
+```
 
 ---
 
 ## Installation
+
+**Prerequisites:** Python 3.11 or later and a free API token from [the-one-api.dev/sign-up](https://the-one-api.dev/sign-up).
 
 **Install directly from GitHub**
 
@@ -98,6 +142,16 @@ The SDK raises `AuthError` at construction time if no key is found. The `.env` f
 
 ## Usage
 
+## Endpoints
+
+| API Endpoint | SDK Method | Description | Filtering / Pagination | Test Coverage |
+|---|---|---|---|---|
+| `GET /movie` | `client.movies.list(...)` | List movies | Supports pagination and supported filters | Unit + demo |
+| `GET /movie/{id}` | `client.movies.get(movie_id)` | Get a movie by ID | Not applicable | Unit + demo |
+| `GET /movie/{id}/quote` | `client.movies.quotes(movie_id, ...)` | List quotes for a movie | Supports pagination and supported filters | Unit + demo |
+| `GET /quote` | `client.quotes.list(...)` | List quotes | Supports pagination and supported filters | Unit + demo |
+| `GET /quote/{id}` | `client.quotes.get(quote_id)` | Get a quote by ID | Not applicable | Unit + demo |
+
 ```python
 from dotenv import load_dotenv
 from lotr_sdk import LotRClient
@@ -143,58 +197,6 @@ with LotRClient() as client:
 > | The Fellowship of the Ring | `5cd95395de30eff6ebccde5c` |
 > | The Two Towers | `5cd95395de30eff6ebccde5b` |
 > | The Return of the King | `5cd95395de30eff6ebccde5d` |
-
----
-
-## Running the Demo
-
-```bash
-# Set up your API key first (see above), then:
-python demo.py
-```
-
-The demo exercises all five endpoints and prints formatted output to the terminal. Expected output:
-
-```
-==============================================================
-  All Movies
-==============================================================
-  Total: 8 titles
-
-  The Lord of the Rings Series                   558 min
-  ...
-
-==============================================================
-  Single Movie — The Fellowship of the Ring
-==============================================================
-  Name:               The Fellowship of the Ring
-  Runtime:            178 min
-  Budget:             $93.0M
-  Box office:         $871.5M
-  Academy Award wins: 4
-  Rotten Tomatoes:    91.0%
-
-==============================================================
-  Movie Quotes — The Fellowship of the Ring (limit=5)
-==============================================================
-  Showing 5 of 503 total quotes
-
-  1. "Who is she? This woman you sing of?"
-  ...
-
-==============================================================
-  All Quotes — sample (limit=5)
-==============================================================
-  Showing 5 of 2383 total quotes across all movies
-  ...
-
-==============================================================
-  Single Quote
-==============================================================
-  "Deagol!!"
-  — character ID: 5cd99d4bde30eff6ebccfe9e
-  — movie ID:     5cd95395de30eff6ebccde5d
-```
 
 ---
 
@@ -392,3 +394,10 @@ rudra-sdk/
 ├── design.md              # Architecture decisions, rationale, and extensibility notes
 └── pyproject.toml
 ```
+
+## Known Limitations
+
+- The SDK intentionally covers only the required movie and quote endpoints for this assignment.
+- Sorting is not exposed because the upstream API behavior was unreliable during testing.
+- The SDK currently provides a synchronous API only; async support is a future enhancement.
+- Retry and cache behavior are configurable, but advanced production concerns such as distributed caching, circuit breaking, and telemetry are outside the assignment scope.

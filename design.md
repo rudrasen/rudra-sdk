@@ -500,6 +500,18 @@ Coverage includes:
 
 ---
 
+## Known Limitations and Intentional Tradeoffs
+
+This SDK is designed as a focused assignment submission rather than a fully published production package.
+The main intentional limitations are:
+1. **Endpoint scope** — only movie and quote endpoints are implemented, while the package structure leaves room for additional resources.
+2. **Synchronous client** — the SDK uses a simple synchronous request model to keep usage familiar and easy to test.
+3. **Sorting omitted** — sorting was not exposed because upstream API behavior was unreliable during validation.
+4. **Basic in-memory caching only** — caching is optional and local to the process. Distributed caching is outside scope.
+5. **No full concurrency abstraction** — cache access is protected, but high-concurrency applications should validate their own usage pattern or use separate clients per worker.
+6. **No package publishing** — the assignment explicitly asks not to publish the SDK, so packaging is sufficient for local installation and review.
+
+---
 ## 14. Roadmap and Extensibility
 
 | Feature | Extension point | Notes |
