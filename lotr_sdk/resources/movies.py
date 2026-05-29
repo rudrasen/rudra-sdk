@@ -33,7 +33,7 @@ class MoviesResource:
         self._http = http
 
     def list(self, filters: FilterOptions | None = None) -> ListResponse[Movie]:
-        """Return all movies, with optional pagination / sorting / filtering.
+        """Return all movies, with optional pagination / filtering.
 
         Args:
             filters: Optional FilterOptions controlling pagination, sort, and

@@ -30,7 +30,7 @@ class QuotesResource:
         self._http = http
 
     def list(self, filters: FilterOptions | None = None) -> ListResponse[Quote]:
-        """Return all quotes, with optional pagination / sorting / filtering.
+        """Return all quotes, with optional pagination / filtering.
 
         Args:
             filters: Optional FilterOptions controlling pagination, sort, and
