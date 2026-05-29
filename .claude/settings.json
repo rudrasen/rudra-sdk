@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -c \"from lotr_sdk.resources import MoviesResource, QuotesResource; print\\('OK:', MoviesResource, QuotesResource\\)\")"
-    ]
-  }
-}
