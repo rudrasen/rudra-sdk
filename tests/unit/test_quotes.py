@@ -133,6 +133,16 @@ class TestQuotesResourceGet:
             quotes_resource.get(bad_id)
         assert exc_info.value.resource_id == bad_id
 
+    @resp.activate
+    def test_get_empty_docs_raises_not_found_error(
+        self, quotes_resource: QuotesResource
+    ) -> None:
+        empty = {"docs": [], "total": 0, "limit": 1, "offset": 0, "page": 1, "pages": 0}
+        resp.add(resp.GET, QUOTE_GET_URL, json=empty, status=200)
+        with pytest.raises(NotFoundError) as exc_info:
+            quotes_resource.get(QUOTE_ID)
+        assert exc_info.value.resource_id == QUOTE_ID
+
 
 class TestQuotesFilterOperatorIntegration:
     """Mock-HTTP integration: FilterOptions operators → correct URL wire format.

@@ -21,8 +21,7 @@ FilterOperator → to_query_params() key format:
 
 LT/GT/GTE/LTE require a numeric filter_value; validated at construction time.
 
-Known limitation: The One API returns HTTP 500 when a ?sort= parameter is
-included in the request. Sorting is therefore not supported in this SDK.
+Note: sorting is not exposed — The One API returns HTTP 500 for any ?sort= parameter.
 """
 
 from __future__ import annotations
@@ -68,21 +67,9 @@ class FilterOptions(BaseModel):
     limit: Optional[int] = None
     page: Optional[int] = None
     offset: Optional[int] = None
-    sort_by: Optional[str] = None
-    sort_order: Optional[str] = None  # "asc" | "desc"
     filter_field: Optional[str] = None
     filter_value: Optional[str] = None
     filter_operator: FilterOperator = FilterOperator.EQ
-
-    @model_validator(mode="after")
-    def _reject_sort_params(self) -> "FilterOptions":
-        """Raise if sort_by or sort_order are set — the API returns HTTP 500 for ?sort=."""
-        if self.sort_by is not None or self.sort_order is not None:
-            raise ValueError(
-                "Sorting is not supported: The One API returns HTTP 500 for ?sort= queries. "
-                "Remove sort_by and sort_order from your FilterOptions."
-            )
-        return self
 
     @model_validator(mode="after")
     def _validate_numeric_operator_value(self) -> "FilterOptions":
@@ -152,19 +139,23 @@ class FilterOptions(BaseModel):
                     params[f"{field}!"] = self.filter_value
 
             elif op == FilterOperator.LT:
-                assert self.filter_value is not None  # guaranteed by model_validator
+                if self.filter_value is None:  # pragma: no cover
+                    raise RuntimeError("filter_value is None for LT — model_validator bug")
                 params[f"{field}<"] = self.filter_value
 
             elif op == FilterOperator.GT:
-                assert self.filter_value is not None  # guaranteed by model_validator
+                if self.filter_value is None:  # pragma: no cover
+                    raise RuntimeError("filter_value is None for GT — model_validator bug")
                 params[f"{field}>"] = self.filter_value
 
             elif op == FilterOperator.GTE:
-                assert self.filter_value is not None  # guaranteed by model_validator
+                if self.filter_value is None:  # pragma: no cover
+                    raise RuntimeError("filter_value is None for GTE — model_validator bug")
                 params[f"{field}>="] = self.filter_value
 
             elif op == FilterOperator.LTE:
-                assert self.filter_value is not None  # guaranteed by model_validator
+                if self.filter_value is None:  # pragma: no cover
+                    raise RuntimeError("filter_value is None for LTE — model_validator bug")
                 params[f"{field}<="] = self.filter_value
 
         return params
